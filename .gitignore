@@ -2,7 +2,3 @@
 __pycache__/
 *.pyc
 data/
-.venv/
-venv/
-.idea/
-.vscode/
