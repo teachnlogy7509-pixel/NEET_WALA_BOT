@@ -1,13 +1,17 @@
 import os
-import sqlite3
+import json
 import asyncio
 import logging
+import sqlite3
 import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, PollAnswerHandler, filters
+)
 from google import genai
 from google.genai import types
 
@@ -32,6 +36,8 @@ log = logging.getLogger("NEET_WALA_BOT")
 
 clients = {}
 
+# ---------------- DATABASE ----------------
+
 def db():
     p = Path(DB_PATH)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -41,7 +47,7 @@ def db():
 
 def init_db():
     with db() as c:
-        c.execute("""
+        c.executescript("""
         CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY,
             name TEXT,
@@ -51,26 +57,129 @@ def init_db():
             correct INTEGER DEFAULT 0,
             wrong INTEGER DEFAULT 0,
             last_topic TEXT
-        )
+        );
+
+        CREATE TABLE IF NOT EXISTS quiz_progress(
+            user_id INTEGER PRIMARY KEY,
+            topic TEXT,
+            questions_json TEXT,
+            current_index INTEGER DEFAULT 0,
+            score INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS polls(
+            poll_id TEXT PRIMARY KEY,
+            chat_id INTEGER,
+            topic TEXT,
+            question TEXT,
+            correct_index INTEGER,
+            explanation TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS answered_polls(
+            poll_id TEXT,
+            user_id INTEGER,
+            PRIMARY KEY(poll_id, user_id)
+        );
         """)
 
 def ensure_user(user):
+    if not user:
+        return
     with db() as c:
         c.execute("""
-        INSERT INTO users(user_id,name,username) VALUES(?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, username=excluded.username
-        """, (user.id, user.full_name or user.username or str(user.id), user.username))
+        INSERT INTO users(user_id,name,username)
+        VALUES(?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          name=excluded.name, username=excluded.username
+        """, (
+            user.id,
+            user.full_name or user.username or str(user.id),
+            user.username,
+        ))
 
-def get_user(uid):
-    with db() as c:
-        return c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-
-def add_score(uid, topic, correct, wrong):
+def add_result(user_id, topic, correct, wrong):
     with db() as c:
         c.execute("""
-        UPDATE users SET score=score+?, quizzes=quizzes+1,
-        correct=correct+?, wrong=wrong+?, last_topic=? WHERE user_id=?
-        """, (correct * 4 - wrong, correct, wrong, topic, uid))
+        UPDATE users
+        SET score=score+?, quizzes=quizzes+1,
+            correct=correct+?, wrong=wrong+?, last_topic=?
+        WHERE user_id=?
+        """, (correct * 4 - wrong, correct, wrong, topic, user_id))
+
+def save_quiz(user_id, topic, questions):
+    with db() as c:
+        c.execute("""
+        INSERT INTO quiz_progress(user_id,topic,questions_json,current_index,score)
+        VALUES(?,?,?,?,0)
+        ON CONFLICT(user_id) DO UPDATE SET
+          topic=excluded.topic,
+          questions_json=excluded.questions_json,
+          current_index=0,
+          score=0
+        """, (user_id, topic, json.dumps(questions, ensure_ascii=False), 0))
+
+def get_quiz(user_id):
+    with db() as c:
+        r = c.execute(
+            "SELECT * FROM quiz_progress WHERE user_id=?", (user_id,)
+        ).fetchone()
+    return r
+
+def update_quiz(user_id, index, score):
+    with db() as c:
+        c.execute("""
+        UPDATE quiz_progress SET current_index=?, score=?
+        WHERE user_id=?
+        """, (index, score, user_id))
+
+def clear_quiz(user_id):
+    with db() as c:
+        c.execute("DELETE FROM quiz_progress WHERE user_id=?", (user_id,))
+
+def top_users(limit=10):
+    with db() as c:
+        return c.execute("""
+        SELECT name, score, quizzes, correct, wrong
+        FROM users
+        ORDER BY score DESC, correct DESC
+        LIMIT ?
+        """, (limit,)).fetchall()
+
+def user_row(user_id):
+    with db() as c:
+        return c.execute(
+            "SELECT * FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+
+def poll_info(poll_id):
+    with db() as c:
+        return c.execute(
+            "SELECT * FROM polls WHERE poll_id=?", (poll_id,)
+        ).fetchone()
+
+def save_poll(poll_id, chat_id, topic, question, correct_index, explanation):
+    with db() as c:
+        c.execute("""
+        INSERT OR REPLACE INTO polls
+        (poll_id,chat_id,topic,question,correct_index,explanation)
+        VALUES(?,?,?,?,?,?)
+        """, (poll_id, chat_id, topic, question, correct_index, explanation))
+
+def already_answered(poll_id, user_id):
+    with db() as c:
+        return c.execute("""
+        SELECT 1 FROM answered_polls WHERE poll_id=? AND user_id=?
+        """, (poll_id, user_id)).fetchone() is not None
+
+def mark_answered(poll_id, user_id):
+    with db() as c:
+        c.execute("""
+        INSERT OR IGNORE INTO answered_polls(poll_id,user_id)
+        VALUES(?,?)
+        """, (poll_id, user_id))
+
+# ---------------- GEMINI ----------------
 
 def get_client(key):
     if key not in clients:
@@ -78,12 +187,14 @@ def get_client(key):
     return clients[key]
 
 def model_candidates(client):
+    # The default is a currently documented Gemini model. We also discover
+    # models exposed by the API so an unavailable model does not hard-fail.
     preferred = [
         GEMINI_MODEL,
         "gemini-3.6-flash",
-        "gemini-3.5-flash-lite",
+        "gemini-3.5-flash",
         "gemini-3.1-flash-lite",
-        "gemini-2.5-flash",
+        "gemini-3-flash-preview",
     ]
     found = []
     try:
@@ -94,7 +205,7 @@ def model_candidates(client):
             if name and name not in found:
                 found.append(name)
     except Exception as e:
-        log.warning("Could not list Gemini models: %s", e)
+        log.warning("Gemini model listing failed: %s", e)
 
     result = []
     for m in preferred:
@@ -104,71 +215,201 @@ def model_candidates(client):
     if found:
         for m in found:
             low = m.lower()
-            if "gemini" in low and not any(x in low for x in ("embedding", "tts", "image", "audio")):
+            if (
+                "gemini" in low
+                and not any(x in low for x in
+                            ("embedding", "tts", "image", "audio", "robotics"))
+            ):
                 if m not in result:
                     result.append(m)
     return result or [GEMINI_MODEL]
 
-def ask_ai(prompt, system=None):
+def ask_ai(prompt, system=None, json_mode=False):
     keys = [k for k in (GEMINI_API_KEY, GEMINI_API_KEY_2) if k]
     if not keys:
-        raise RuntimeError("GEMINI_API_KEY missing in Railway Variables.")
+        raise RuntimeError(
+            "GEMINI_API_KEY missing. Railway Variables में API key जोड़ें."
+        )
 
     last = None
     for key in keys:
         client = get_client(key)
         for model in model_candidates(client):
             try:
-                config = types.GenerateContentConfig(
-                    system_instruction=system or "",
-                    max_output_tokens=6000,
-                )
+                kwargs = {"max_output_tokens": 8000}
+                if system:
+                    kwargs["system_instruction"] = system
+                if json_mode:
+                    kwargs["response_mime_type"] = "application/json"
+
+                config = types.GenerateContentConfig(**kwargs)
                 response = client.models.generate_content(
-                    model=model, contents=prompt, config=config
+                    model=model,
+                    contents=prompt,
+                    config=config,
                 )
                 text = getattr(response, "text", None)
                 if text:
-                    log.info("Gemini success with model=%s", model)
+                    log.info("Gemini success: %s", model)
                     return text.strip()
             except Exception as e:
                 last = e
                 log.warning("Gemini model %s failed: %s", model, e)
+
     raise RuntimeError(f"Gemini request failed: {last}")
 
-def chunks(text, n=3900):
-    return [text[i:i+n] for i in range(0, len(text), n)]
+SYSTEM = """तुम NEET परीक्षा के लिए हिंदी AI Study Assistant हो।
+उत्तर NCERT-केंद्रित, तथ्यात्मक और सरल हिंदी में दो।
+मनगढ़ंत तथ्य या citation मत बनाओ।"""
 
-SYSTEM = """तुम NEET तैयारी के लिए हिंदी AI Study Assistant हो।
-उत्तर सरल, स्पष्ट और NCERT-केंद्रित रखो। गलत तथ्य या मनगढ़ंत citation मत बनाओ।"""
+# ---------------- HELPERS ----------------
 
-HELP = """📚 NEET AI STUDY BOT
+def parse_json(text):
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.replace("```json", "", 1).replace("```", "", 1).strip()
+    return json.loads(text)
 
-/start — Bot शुरू करें
-/help — Commands
-/quiz विषय [प्रश्न] — AI MCQ
-/chapter अध्याय [प्रश्न] — Chapter MCQ
-/leaderboard — Top 10
-/profile — आपकी progress
-/pdf — PDF भेजें
+def make_question_prompt(topic):
+    return f"""
+विषय: {topic}
+
+NEET स्तर का केवल 1 मूल MCQ बनाओ।
+NCERT-केंद्रित रहो।
+
+सिर्फ इस JSON format में उत्तर दो:
+{{
+  "question": "प्रश्न",
+  "options": ["A विकल्प", "B विकल्प", "C विकल्प", "D विकल्प"],
+  "correct_index": 0,
+  "explanation": "छोटी और स्पष्ट व्याख्या"
+}}
+
+नियम:
+- options ठीक 4 हों
+- correct_index केवल 0,1,2,3 हो
+- हिंदी में
+- एक ही सही उत्तर हो
+- duplicate या अस्पष्ट प्रश्न नहीं
 """
+
+def make_quiz_prompt(topic, count):
+    return f"""
+विषय: {topic}
+{count} मूल NEET MCQ बनाओ।
+
+सिर्फ JSON array दो:
+[
+  {{
+    "question": "प्रश्न",
+    "options": ["A", "B", "C", "D"],
+    "correct_index": 0,
+    "explanation": "व्याख्या"
+  }}
+]
+
+नियम:
+- ठीक {count} questions
+- हर question में ठीक 4 options
+- correct_index 0-3
+- NCERT आधारित
+- हिंदी
+- कोई duplicate नहीं
+- कम से कम 2 questions concept/application आधारित
+"""
+
+async def send_parts(message, text):
+    for i in range(0, len(text), 3900):
+        await message.reply_text(text[i:i+3900])
+
+async def generate_question(topic):
+    raw = await asyncio.to_thread(
+        ask_ai, make_question_prompt(topic), SYSTEM, True
+    )
+    q = parse_json(raw)
+    if not isinstance(q, dict):
+        raise ValueError("AI ने invalid question दिया.")
+    if len(q.get("options", [])) != 4:
+        raise ValueError("AI ने 4 options नहीं दिए.")
+    idx = int(q.get("correct_index", -1))
+    if idx not in (0, 1, 2, 3):
+        raise ValueError("AI का correct_index invalid है.")
+    return q
+
+async def generate_questions(topic, count):
+    # Keep batches modest so Telegram/Railway remains responsive.
+    raw = await asyncio.to_thread(
+        ask_ai, make_quiz_prompt(topic, count), SYSTEM, True
+    )
+    data = parse_json(raw)
+    if not isinstance(data, list):
+        raise ValueError("AI ने question list नहीं दी.")
+    clean = []
+    for q in data:
+        if (
+            isinstance(q, dict)
+            and isinstance(q.get("question"), str)
+            and isinstance(q.get("options"), list)
+            and len(q["options"]) == 4
+            and int(q.get("correct_index", -1)) in (0,1,2,3)
+        ):
+            clean.append({
+                "question": q["question"],
+                "options": q["options"],
+                "correct_index": int(q["correct_index"]),
+                "explanation": q.get("explanation", ""),
+            })
+    if len(clean) < count:
+        raise ValueError(f"AI ने {len(clean)}/{count} valid questions दिए.")
+    return clean[:count]
+
+# ---------------- COMMANDS ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
-    await update.message.reply_text("👋 नमस्ते!\n\n" + HELP)
+    await update.message.reply_text(
+        "👋 नमस्ते! NEET AI Study Bot तैयार है.\n\n"
+        "🤖 हर study command AI-powered है.\n\n"
+        "📚 Commands:\n"
+        "/quizar कोशिका 10 — Interactive MCQ test\n"
+        "/pollar कोशिका — Native Telegram quiz poll, बिना timing\n"
+        "/chapterar मानव_प्रजनन 10 — Chapter test\n"
+        "/askar आपका सवाल — AI explanation\n"
+        "/leaderboardar — Top 10\n"
+        "/profilear — आपकी progress\n"
+        "/resumear — अधूरा quiz जारी करें\n"
+        "/pdfar — PDF भेजें → 90 NEET Bio polls\n"
+        "/neet720ar — 180-question NEET pattern test\n"
+        "/helpar — पूरी मदद"
+    )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update.effective_user)
-    await update.message.reply_text(HELP)
+    await start(update, context)
 
-async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_user)
+    question = " ".join(context.args).strip()
+    if not question:
+        await update.message.reply_text(
+            "उदाहरण:\n/askar माइटोकॉन्ड्रिया को powerhouse क्यों कहते हैं?"
+        )
+        return
+    await update.message.reply_text("🤖 AI सोच रहा है...")
+    try:
+        answer = await asyncio.to_thread(ask_ai, question, SYSTEM, False)
+        await send_parts(update.message, answer)
+    except Exception as e:
+        await update.message.reply_text(f"❌ AI error: {str(e)[:900]}")
+
+async def quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
     if not context.args:
-        await update.message.reply_text("उदाहरण: /quiz कोशिका 20")
+        await update.message.reply_text("उदाहरण: /quizar कोशिका 10")
         return
 
-    count = 20
+    count = 10
     if context.args[-1].isdigit():
-        count = max(5, min(60, int(context.args[-1])))
+        count = max(5, min(50, int(context.args[-1])))
         topic = " ".join(context.args[:-1]).strip()
     else:
         topic = " ".join(context.args).strip()
@@ -176,89 +417,442 @@ async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not topic:
         topic = "जीव विज्ञान"
 
-    await update.message.reply_text(f"⏳ {topic} पर {count} MCQ बन रहे हैं...")
-    prompt = f"""विषय: {topic}
-{count} NEET स्तर के मूल MCQ बनाओ।
-
-Format:
-Q1. प्रश्न
-A) विकल्प
-B) विकल्प
-C) विकल्प
-D) विकल्प
-सही उत्तर: B
-व्याख्या: 1-2 पंक्तियाँ
-
-केवल हिंदी, 4 विकल्प, NCERT आधारित और duplicate नहीं।"""
-
+    await update.message.reply_text(
+        f"⏳ AI {topic} पर {count} प्रश्न बना रहा है..."
+    )
     try:
-        text = await asyncio.to_thread(ask_ai, prompt, SYSTEM)
-        for part in chunks(text):
-            await update.message.reply_text(part)
+        questions = []
+        # Generate in small batches to reduce malformed large JSON responses.
+        for start_i in range(0, count, 5):
+            batch = min(5, count - start_i)
+            questions.extend(await generate_questions(topic, batch))
+        save_quiz(update.effective_user.id, topic, questions)
+        await send_next_inline_question(update, context)
     except Exception as e:
-        await update.message.reply_text(f"❌ AI error:\n{str(e)[:900]}")
+        await update.message.reply_text(
+            f"❌ Quiz generation error:\n{str(e)[:1000]}"
+        )
 
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def chapter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Same AI engine, with explicit chapter wording.
+    if not context.args:
+        await update.message.reply_text(
+            "उदाहरण: /chapterar कोशिका 10"
+        )
+        return
+    await quiz_cmd(update, context)
+
+async def send_next_inline_question(update, context):
+    row = get_quiz(update.effective_user.id)
+    if not row:
+        return
+    questions = json.loads(row["questions_json"])
+    i = row["current_index"]
+    if i >= len(questions):
+        await finish_inline_quiz(update, context, row["topic"], row["score"], len(questions))
+        return
+
+    q = questions[i]
+    buttons = [
+        [InlineKeyboardButton(
+            f"{chr(65+j)}) {opt}",
+            callback_data=f"ans:{i}:{j}"
+        )]
+        for j, opt in enumerate(q["options"])
+    ]
+    text = (
+        f"📝 प्रश्न {i+1}/{len(questions)}\n"
+        f"📚 {row['topic']}\n\n{q['question']}"
+    )
+    await update.effective_message.reply_text(
+        text, reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def inline_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, i_s, chosen_s = query.data.split(":")
+        i, chosen = int(i_s), int(chosen_s)
+    except Exception:
+        return
+
+    row = get_quiz(query.from_user.id)
+    if not row:
+        await query.edit_message_text("यह quiz session नहीं मिला. /quizar से नया शुरू करें.")
+        return
+
+    questions = json.loads(row["questions_json"])
+    if i != row["current_index"] or i >= len(questions):
+        await query.answer("यह प्रश्न पहले ही process हो चुका है.", show_alert=True)
+        return
+
+    q = questions[i]
+    correct = q["correct_index"]
+    ok = chosen == correct
+    score = row["score"] + (4 if ok else -1)
+
+    result = "✅ सही उत्तर!" if ok else f"❌ गलत! सही उत्तर: {chr(65+correct)}) {q['options'][correct]}"
+    explanation = q.get("explanation", "")
+
+    update_quiz(query.from_user.id, i + 1, score)
+    add_result(query.from_user.id, row["topic"], 1 if ok else 0, 0 if ok else 1)
+
+    await query.edit_message_text(
+        f"{result}\n\n💡 {explanation}\n\n"
+        f"📊 Current score: {score}"
+    )
+
+    new_row = get_quiz(query.from_user.id)
+    if new_row:
+        questions2 = json.loads(new_row["questions_json"])
+        if new_row["current_index"] >= len(questions2):
+            await query.message.reply_text(
+                f"🏁 Quiz पूरा!\n🏆 Score: {new_row['score']}\n"
+                f"📚 {new_row['topic']}\n"
+                f"कुल प्रश्न: {len(questions2)}"
+            )
+            clear_quiz(query.from_user.id)
+        else:
+            await send_next_inline_question(query, context)
+
+async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
-    with db() as c:
-        rows = c.execute("""
-        SELECT name,score,quizzes,correct FROM users
-        ORDER BY score DESC, correct DESC LIMIT 10
-        """).fetchall()
+    row = get_quiz(update.effective_user.id)
+    if not row:
+        await update.message.reply_text(
+            "कोई अधूरा quiz नहीं है. /quizar विषय 10 से शुरू करें."
+        )
+        return
+    await update.message.reply_text(
+        f"▶️ Resume: {row['topic']}\n"
+        f"Question: {row['current_index']+1}/{len(json.loads(row['questions_json']))}"
+    )
+    await send_next_inline_question(update, context)
+
+async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_user)
+    rows = top_users(10)
     if not rows:
         await update.message.reply_text("Leaderboard अभी खाली है.")
         return
     lines = ["🏆 TOP 10 LEADERBOARD", ""]
     for i, r in enumerate(rows, 1):
-        lines.append(f"{i}. {r['name']} — {r['score']} अंक | Quiz {r['quizzes']} | सही {r['correct']}")
+        lines.append(
+            f"{i}. {r['name']} — {r['score']} अंक | "
+            f"Quiz: {r['quizzes']} | सही: {r['correct']}"
+        )
     await update.message.reply_text("\n".join(lines))
 
-async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
-    r = get_user(update.effective_user.id)
+    r = user_row(update.effective_user.id)
     total = r["correct"] + r["wrong"]
     acc = round(r["correct"] / total * 100, 1) if total else 0
     await update.message.reply_text(
-        f"👤 {r['name']}\n🏆 Score: {r['score']}\n"
-        f"📝 Quiz: {r['quizzes']}\n✅ सही: {r['correct']}\n"
-        f"❌ गलत: {r['wrong']}\n🎯 Accuracy: {acc}%"
+        f"👤 {r['name']}\n"
+        f"🏆 Score: {r['score']}\n"
+        f"📝 Quiz attempts: {r['quizzes']}\n"
+        f"✅ सही: {r['correct']}\n"
+        f"❌ गलत: {r['wrong']}\n"
+        f"🎯 Accuracy: {acc}%\n"
+        f"📚 Last topic: {r['last_topic'] or '-'}"
     )
+
+async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Native Telegram quiz poll. No open_period/close_date = no timing."""
+    ensure_user(update.effective_user)
+    topic = " ".join(context.args).strip() if context.args else "NEET Biology"
+    await update.message.reply_text(f"🤖 {topic} का AI poll question बना रहा हूँ...")
+    try:
+        q = await generate_question(topic)
+        msg = await context.bot.send_poll(
+            chat_id=update.effective_chat.id,
+            question=q["question"],
+            options=q["options"],
+            type="quiz",
+            correct_option_id=q["correct_index"],
+            is_anonymous=False,
+            # Deliberately no open_period and no close_date:
+            # the poll has no timer and remains open.
+        )
+        save_poll(
+            msg.poll.id,
+            update.effective_chat.id,
+            topic,
+            q["question"],
+            q["correct_index"],
+            q.get("explanation", ""),
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Poll error:\n{str(e)[:1000]}"
+        )
+
+async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ans = update.poll_answer
+    info = poll_info(ans.poll_id)
+    if not info or not ans.option_ids:
+        return
+    if already_answered(ans.poll_id, ans.user.id):
+        return
+
+    chosen = ans.option_ids[0]
+    correct = int(info["correct_index"])
+    ok = chosen == correct
+    mark_answered(ans.poll_id, ans.user.id)
+    ensure_user(ans.user)
+
+    add_result(
+        ans.user.id,
+        info["topic"],
+        1 if ok else 0,
+        0 if ok else 1,
+    )
+
+    user_name = ans.user.full_name or ans.user.username or str(ans.user.id)
+    result = (
+        f"🎉 {user_name} ने सही उत्तर दिया!"
+        if ok else
+        f"❌ {user_name} का उत्तर गलत था।"
+    )
+    explanation = info["explanation"] or ""
+    try:
+        await context.bot.send_message(
+            chat_id=info["chat_id"],
+            text=f"{result}\n💡 {explanation}",
+        )
+    except Exception as e:
+        log.warning("Could not send poll result message: %s", e)
+
+
+async def pdf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📚 PDF भेजें।\n\n"
+        "मैं PDF से NEET Biology के प्रश्न तैयार करके "
+        "Telegram Quiz Poll के रूप में इसी chat/group में भेजूँगा।\n\n"
+        "🔢 अधिकतम 90 प्रश्न\n"
+        "🧠 NEET level\n"
+        "🧬 Assertion-Reason / कथन-आधारित प्रश्न भी\n"
+        "⏱️ Poll में कोई timer नहीं होगा।"
+    )
+
+def make_pdf_question_prompt(book_text, count):
+    return f"""
+तुम NEET Biology question setter हो।
+
+नीचे किसी Biology book/PDF का text दिया गया है।
+इसी दिए गए material के concepts पर आधारित {count} मूल NEET-level MCQ बनाओ।
+किसी पुस्तक के लंबे वाक्य copy मत करो; प्रश्न को अपने शब्दों में बनाओ।
+
+Question mix:
+- लगभग 50% normal conceptual MCQ
+- लगभग 25% Assertion-Reason / कथन-कारण
+- लगभग 25% statement-based / multiple-statement MCQ
+
+सिर्फ JSON array दो:
+[
+  {{
+    "question": "प्रश्न",
+    "options": ["A", "B", "C", "D"],
+    "correct_index": 0,
+    "explanation": "छोटी NCERT/NEET स्तर की व्याख्या"
+  }}
+]
+
+Assertion-Reason के लिए options इस प्रकार रखो:
+A) A और R दोनों सही हैं तथा R, A की सही व्याख्या है
+B) A और R दोनों सही हैं लेकिन R, A की सही व्याख्या नहीं है
+C) A सही है लेकिन R गलत है
+D) A गलत है लेकिन R सही है
+
+नियम:
+- ठीक {count} प्रश्न
+- हर प्रश्न में ठीक 4 options
+- केवल एक सही उत्तर
+- NEET Biology level
+- हिंदी
+- दिए गए PDF के concepts से बाहर की मनगढ़ंत जानकारी नहीं
+- duplicate questions नहीं
+- question और options बहुत लंबे नहीं हों
+
+PDF TEXT:
+{book_text}
+"""
+
+async def generate_pdf_questions(book_text, count=90):
+    questions = []
+    # Generate small batches so large PDFs/JSON responses are less likely to fail.
+    for offset in range(0, count, 10):
+        batch_count = min(10, count - offset)
+        raw = await asyncio.to_thread(
+            ask_ai,
+            make_pdf_question_prompt(book_text, batch_count),
+            SYSTEM,
+            True
+        )
+        data = parse_json(raw)
+        if not isinstance(data, list):
+            raise ValueError("AI ने question list नहीं दी.")
+
+        for q in data:
+            try:
+                idx = int(q.get("correct_index", -1))
+            except Exception:
+                idx = -1
+            if (
+                isinstance(q, dict)
+                and isinstance(q.get("question"), str)
+                and isinstance(q.get("options"), list)
+                and len(q["options"]) == 4
+                and idx in (0, 1, 2, 3)
+            ):
+                questions.append({
+                    "question": q["question"][:300],
+                    "options": [str(x)[:100] for x in q["options"]],
+                    "correct_index": idx,
+                    "explanation": str(q.get("explanation", ""))[:700],
+                })
+        if len(questions) >= count:
+            break
+
+    if len(questions) < count:
+        raise ValueError(
+            f"PDF से केवल {len(questions)}/{count} valid questions बन पाए."
+        )
+
+    # Remove exact duplicate questions while keeping order.
+    seen = set()
+    unique = []
+    for q in questions:
+        key = q["question"].strip().lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(q)
+    if len(unique) < count:
+        raise ValueError(
+            f"Duplicate हटाने के बाद {len(unique)}/{count} questions बचे."
+        )
+    return unique[:count]
+
+async def post_pdf_polls(chat_id, questions, bot, status_message=None):
+    total = len(questions)
+    for i, q in enumerate(questions, 1):
+        msg = await bot.send_poll(
+            chat_id=chat_id,
+            question=f"Q{i}/{total}  {q['question']}",
+            options=q["options"],
+            type="quiz",
+            correct_option_id=q["correct_index"],
+            is_anonymous=False,
+            # IMPORTANT: no open_period and no close_date.
+            # Therefore there is NO TIMER on these polls.
+        )
+        save_poll(
+            msg.poll.id,
+            chat_id,
+            "PDF • NEET Biology",
+            q["question"],
+            q["correct_index"],
+            q.get("explanation", ""),
+        )
+
+        # Small delay prevents flooding Telegram with 90 polls at once.
+        await asyncio.sleep(0.8)
+
+    if status_message:
+        await status_message.edit_text(
+            f"✅ पूरा! PDF से {total} NEET Biology Quiz Polls group/chat में डाल दिए गए.\n"
+            f"🧠 Normal + कथन-आधारित + Assertion-Reason\n"
+            f"⏱️ सभी polls में कोई timer नहीं है."
+        )
 
 async def pdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.document:
         return
     if fitz is None:
-        await update.message.reply_text("❌ PDF support package missing.")
+        await update.message.reply_text("❌ PDF package उपलब्ध नहीं है.")
         return
+
     doc = update.message.document
     if doc.file_size and doc.file_size > 15 * 1024 * 1024:
-        await update.message.reply_text("❌ PDF 15 MB से छोटी रखें.")
+        await update.message.reply_text(
+            "❌ PDF 15 MB से छोटी रखें."
+        )
         return
-    await update.message.reply_text("📄 PDF मिल गई, text पढ़ रहा हूँ...")
+
+    status = await update.message.reply_text(
+        "📄 PDF मिल गई.\n"
+        "🔍 Text पढ़ रहा हूँ और NEET Biology questions तैयार कर रहा हूँ...\n"
+        "⏳ 90 questions में थोड़ा समय लग सकता है."
+    )
+
     path = None
     try:
         tg = await doc.get_file()
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
             path = f.name
         await tg.download_to_drive(path)
+
         pdf = fitz.open(path)
-        text = "\n".join(p.get_text() for p in pdf).strip()
+        pages_text = []
+        for page in pdf:
+            pages_text.append(page.get_text())
         pdf.close()
+
+        text = "\n".join(pages_text).strip()
         if not text:
-            await update.message.reply_text("❌ PDF में selectable text नहीं मिला.")
+            await status.edit_text(
+                "❌ PDF में selectable text नहीं मिला.\n"
+                "Scanned/image-only PDF के लिए OCR जोड़ना होगा."
+            )
             return
-        prompt = f"""नीचे PDF का text है। इससे 10 मूल NEET MCQ बनाओ।
-हर प्रश्न में 4 विकल्प, सही उत्तर और छोटी explanation हो।
-PDF TEXT:
-{text[:50000]}"""
-        answer = await asyncio.to_thread(ask_ai, prompt, SYSTEM)
-        for part in chunks(answer):
-            await update.message.reply_text(part)
+
+        # Keep enough context for a book while avoiding an enormous API request.
+        # The bot generates questions from the extracted material; it does not
+        # reproduce the book text in Telegram.
+        text = text[:180000]
+
+        await status.edit_text(
+            "🧠 PDF पढ़ ली गई.\n"
+            "अब 90 NEET Biology questions बन रहे हैं...\n"
+            "कथन-कारण और statement-based questions भी शामिल होंगे."
+        )
+
+        questions = await generate_pdf_questions(text, 90)
+
+        await status.edit_text(
+            "📊 90 questions तैयार हैं.\n"
+            "अब इसी group/chat में Quiz Polls भेजे जा रहे हैं...\n"
+            "⏱️ कोई poll timer नहीं है."
+        )
+
+        await post_pdf_polls(
+            update.effective_chat.id,
+            questions,
+            context.bot,
+            status
+        )
+
     except Exception as e:
-        await update.message.reply_text(f"❌ PDF/AI error:\n{str(e)[:900]}")
+        log.exception("PDF pipeline failed")
+        try:
+            await status.edit_text(
+                f"❌ PDF → Poll error:\n{str(e)[:1200]}"
+            )
+        except Exception:
+            pass
     finally:
         if path:
             Path(path).unlink(missing_ok=True)
+
+async def neet720_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🧪 NEET pattern test:\n"
+        "90 Biology + 45 Physics + 45 Chemistry = 180 questions.\n"
+        "यह बड़ा test है; AI generation में थोड़ा समय लग सकता है.\n\n"
+        "शुरू करने के लिए /quizar Biology 50, /quizar Physics 50 या /quizar Chemistry 50 इस्तेमाल करें."
+    )
 
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -266,27 +860,43 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     ensure_user(update.effective_user)
     try:
-        answer = await asyncio.to_thread(ask_ai, text, SYSTEM)
-        for part in chunks(answer):
-            await update.message.reply_text(part)
+        answer = await asyncio.to_thread(ask_ai, text, SYSTEM, False)
+        await send_parts(update.message, answer)
     except Exception as e:
-        await update.message.reply_text(f"❌ AI error:\n{str(e)[:900]}")
+        await update.message.reply_text(
+            f"❌ AI error:\n{str(e)[:1000]}"
+        )
 
-def build():
+async def error_handler(update, context):
+    log.exception("Unhandled bot error", exc_info=context.error)
+
+def build_app():
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN missing in Railway Variables.")
     init_db()
+
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("quiz", quiz))
-    app.add_handler(CommandHandler("chapter", quiz))
-    app.add_handler(CommandHandler("leaderboard", leaderboard))
-    app.add_handler(CommandHandler("profile", profile))
+
+    app.add_handler(CommandHandler("startar", start))
+    app.add_handler(CommandHandler("helpar", help_cmd))
+    app.add_handler(CommandHandler("askar", ask_cmd))
+    app.add_handler(CommandHandler("quizar", quiz_cmd))
+    app.add_handler(CommandHandler("chapterar", chapter_cmd))
+    app.add_handler(CommandHandler("pollar", poll_cmd))
+    app.add_handler(CommandHandler("leaderboardar", leaderboard_cmd))
+    app.add_handler(CommandHandler("profilear", profile_cmd))
+    app.add_handler(CommandHandler("resumear", resume_cmd))
+    app.add_handler(CommandHandler("pdfar", pdf_cmd))
+    app.add_handler(CommandHandler("neet720ar", neet720_cmd))
+
+    app.add_handler(CallbackQueryHandler(inline_answer, pattern=r"^ans:"))
+    app.add_handler(PollAnswerHandler(poll_answer))
     app.add_handler(MessageHandler(filters.Document.PDF, pdf_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
+
+    app.add_error_handler(error_handler)
     return app
 
 if __name__ == "__main__":
-    log.info("Starting NEET WALA BOT")
-    build().run_polling(allowed_updates=["message"])
+    log.info("NEET WALA BOT starting...")
+    build_app().run_polling(allowed_updates=["message", "callback_query", "poll_answer"])
