@@ -147,3 +147,29 @@ The PDF polls have no `open_period` or `close_date`, so there is no timer.
 - `/pdfar 50` = 50 questions.
 - `/pdfar 90` = 90 questions.
 No other bot features were intentionally changed in this build.
+
+
+## Final fixes
+- `/pollar` defaults to 5 polls; `/pollar topic 10` sends 10.
+- `/quizar` and `/chapterar` generate and continue through all requested questions.
+- Interactive quiz has a 30-second timer; timeout automatically advances.
+- `/pdfar` defaults to 50; `/pdfar 30`, `/pdfar 50`, `/pdfar 90` are supported.
+- PDF duplicate questions are refilled with new AI-generated questions instead of failing at 85/90 or 89/90.
+- Gemini uses only `GEMINI_MODEL` (default `gemini-3.6-flash`) and falls back from API key 1 to API key 2 on quota/API failure.
+- PDF polls and `/pollar` polls have no timer.
+
+
+## Final fixes
+- Uses `pymupdf` instead of deprecated `fitz` import.
+- `/pdfar` defaults to 50 and accepts 1–90.
+- PDF generation refills duplicate/invalid questions instead of stopping at 85/90.
+- `/pollar` generates the requested number of untimed native quiz polls.
+- `/quizar` and `/chapterar` generate questions in small batches with duplicate-safe refill.
+- Interactive quiz keeps the session in SQLite and advances after an answer or 30-second timeout.
+- `GEMINI_MODEL` defaults to `gemini-3.6-flash`.
+
+
+## Daily Scheduler
+`/shedulear 21:00 कोशिका 5` creates a daily IST schedule for 5 untimed quiz polls.
+`/shedulearlistrar` lists schedules. `/sheduleardel 1` deletes schedule #1.
+Only Telegram group admins can manage schedules. Schedules persist in SQLite across Railway restarts.

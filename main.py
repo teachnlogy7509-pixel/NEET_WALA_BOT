@@ -6,6 +6,8 @@ import re
 import sqlite3
 import tempfile
 from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,9 +19,9 @@ from google import genai
 from google.genai import types
 
 try:
-    import fitz
+    import pymupdf
 except ImportError:
-    fitz = None
+    pymupdf = None
 
 load_dotenv()
 
@@ -36,6 +38,8 @@ logging.basicConfig(
 log = logging.getLogger("NEET_WALA_BOT")
 
 clients = {}
+quiz_timer_tasks = {}
+pdf_requests = {}
 
 # ---------------- DATABASE ----------------
 
@@ -81,6 +85,17 @@ def init_db():
             poll_id TEXT,
             user_id INTEGER,
             PRIMARY KEY(poll_id, user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS schedules(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            time_hm TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 5,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_run_date TEXT
         );
         """)
 
@@ -188,49 +203,9 @@ def get_client(key):
     return clients[key]
 
 def model_candidates(client):
-    # The default is a currently documented Gemini model. We also discover
-    # models exposed by the API so an unavailable model does not hard-fail.
-    preferred = [
-        GEMINI_MODEL,
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-        "gemini-3.1-flash-lite",
-    ]
-    found = []
-    try:
-        for m in client.models.list():
-            name = getattr(m, "name", "") or ""
-            if name.startswith("models/"):
-                name = name[7:]
-            if name and name not in found:
-                found.append(name)
-    except Exception as e:
-        log.warning("Gemini model listing failed: %s", e)
-
-    deprecated_prefixes = (
-        "gemini-1.5-", "gemini-1.0-", "gemini-2.0-", "gemini-2.5-"
-    )
-    preferred = [
-        m for m in preferred
-        if m and not m.lower().startswith(deprecated_prefixes)
-    ]
-
-    result = []
-    for m in preferred:
-        if m and m not in result and (not found or m in found):
-            result.append(m)
-
-    if found:
-        for m in found:
-            low = m.lower()
-            if (
-                "gemini" in low
-                and not any(x in low for x in
-                            ("embedding", "tts", "image", "audio", "robotics"))
-            ):
-                if m not in result:
-                    result.append(m)
-    return result or [GEMINI_MODEL]
+    # Use ONLY the configured stable model. Do not silently fall back to a
+    # different model (which can unexpectedly hit a different quota).
+    return [GEMINI_MODEL or "gemini-3.6-flash"]
 
 def ask_ai(prompt, system=None, json_mode=False):
     keys = [k for k in (GEMINI_API_KEY, GEMINI_API_KEY_2) if k]
@@ -240,7 +215,7 @@ def ask_ai(prompt, system=None, json_mode=False):
         )
 
     last = None
-    for key in keys:
+    for key_no, key in enumerate(keys, 1):
         client = get_client(key)
         for model in model_candidates(client):
             try:
@@ -250,21 +225,26 @@ def ask_ai(prompt, system=None, json_mode=False):
                 if json_mode:
                     kwargs["response_mime_type"] = "application/json"
 
-                config = types.GenerateContentConfig(**kwargs)
                 response = client.models.generate_content(
                     model=model,
                     contents=prompt,
-                    config=config,
+                    config=types.GenerateContentConfig(**kwargs),
                 )
                 text = getattr(response, "text", None)
                 if text:
-                    log.info("Gemini success: %s", model)
+                    log.info("Gemini success: %s using API key #%s", model, key_no)
                     return text.strip()
             except Exception as e:
                 last = e
-                log.warning("Gemini model %s failed: %s", model, e)
+                msg = str(e)
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    log.warning("Gemini quota on API key #%s; trying next key.", key_no)
+                    continue
+                log.warning("Gemini model %s failed on API key #%s: %s",
+                            model, key_no, e)
 
-    raise RuntimeError(f"Gemini request failed: {last}")
+    raise RuntimeError(f"Gemini request failed on both API keys: {last}")
+
 
 SYSTEM = """तुम NEET परीक्षा के लिए हिंदी AI Study Assistant हो।
 उत्तर NCERT-केंद्रित, तथ्यात्मक और सरल हिंदी में दो।
@@ -345,31 +325,172 @@ async def generate_question(topic):
     return q
 
 async def generate_questions(topic, count):
-    # Keep batches modest so Telegram/Railway remains responsive.
-    raw = await asyncio.to_thread(
-        ask_ai, make_quiz_prompt(topic, count), SYSTEM, True
-    )
-    data = parse_json(raw)
-    if not isinstance(data, list):
-        raise ValueError("AI ने question list नहीं दी.")
-    clean = []
-    for q in data:
-        if (
-            isinstance(q, dict)
-            and isinstance(q.get("question"), str)
-            and isinstance(q.get("options"), list)
-            and len(q["options"]) == 4
-            and int(q.get("correct_index", -1)) in (0,1,2,3)
-        ):
-            clean.append({
-                "question": q["question"],
-                "options": q["options"],
-                "correct_index": int(q["correct_index"]),
-                "explanation": q.get("explanation", ""),
-            })
+    """Generate exactly count valid, non-duplicate questions in small batches."""
+    clean, seen = [], set()
+    attempts = 0
+    max_attempts = max(6, count // 2 + 4)
+
+    while len(clean) < count and attempts < max_attempts:
+        remaining = count - len(clean)
+        batch = min(5, remaining)
+
+        try:
+            raw = await asyncio.to_thread(
+                ask_ai, make_quiz_prompt(topic, batch), SYSTEM, True
+            )
+            data = parse_json(raw)
+        except Exception:
+            attempts += 1
+            await asyncio.sleep(0.8)
+            continue
+
+        if isinstance(data, list):
+            for q in data:
+                if not isinstance(q, dict):
+                    continue
+                try:
+                    idx = int(q.get("correct_index", -1))
+                except Exception:
+                    idx = -1
+                opts = q.get("options")
+                question = str(q.get("question", "")).strip()
+                if (
+                    question and isinstance(opts, list) and len(opts) == 4
+                    and idx in (0, 1, 2, 3)
+                ):
+                    key = " ".join(question.lower().split())
+                    if key not in seen:
+                        seen.add(key)
+                        clean.append({
+                            "question": question[:300],
+                            "options": [str(x)[:100] for x in opts],
+                            "correct_index": idx,
+                            "explanation": str(q.get("explanation", ""))[:900],
+                        })
+                        if len(clean) >= count:
+                            break
+        attempts += 1
+
     if len(clean) < count:
-        raise ValueError(f"AI ने {len(clean)}/{count} valid questions दिए.")
+        raise ValueError(
+            f"AI से {len(clean)}/{count} unique questions बने। "
+            f"Gemini quota/network की स्थिति भी check करें."
+        )
     return clean[:count]
+
+
+
+# ---------------- DAILY SCHEDULER ----------------
+IST = ZoneInfo("Asia/Kolkata")
+scheduler_task = None
+
+async def chat_admin(update):
+    chat=update.effective_chat; user=update.effective_user
+    if chat.type=="private": return True
+    try:
+        m=await update.get_bot().get_chat_member(chat.id,user.id)
+        return m.status in ("creator","administrator")
+    except Exception:
+        return False
+
+def add_schedule(chat_id, owner_id, time_hm, topic, count):
+    with db() as c:
+        cur=c.execute("INSERT INTO schedules(chat_id,owner_id,time_hm,topic,count) VALUES(?,?,?,?,?)",
+                      (chat_id,owner_id,time_hm,topic,count))
+        return cur.lastrowid
+
+def list_schedules(chat_id):
+    with db() as c:
+        return c.execute("SELECT id,time_hm,topic,count,enabled FROM schedules WHERE chat_id=? ORDER BY id",(chat_id,)).fetchall()
+
+def delete_schedule(chat_id,sid):
+    with db() as c:
+        return c.execute("DELETE FROM schedules WHERE chat_id=? AND id=?",(chat_id,sid)).rowcount>0
+
+def due_schedules():
+    now=datetime.now(IST); hm=now.strftime("%H:%M"); today=now.strftime("%Y-%m-%d")
+    with db() as c:
+        return c.execute("""SELECT id,chat_id,topic,count FROM schedules
+                            WHERE enabled=1 AND time_hm=?
+                            AND (last_run_date IS NULL OR last_run_date<>?)""",(hm,today)).fetchall()
+
+def mark_schedule_run(sid,today):
+    with db() as c:c.execute("UPDATE schedules SET last_run_date=? WHERE id=?",(today,sid))
+
+async def run_scheduled_poll(bot,row):
+    sid=row["id"]; chat_id=row["chat_id"]; topic=row["topic"]; count=int(row["count"])
+    mark_schedule_run(sid,datetime.now(IST).strftime("%Y-%m-%d"))
+    try:
+        status=await bot.send_message(chat_id,f"🗓️ Scheduled Quiz\n📚 {topic}\n🤖 {count} questions बन रहे हैं...\n⏱️ कोई timer नहीं होगा।")
+        questions=await generate_poll_questions(topic,count)
+        if not questions:
+            await status.edit_text("❌ Scheduled quiz के questions नहीं बने।"); return
+        for n,q in enumerate(questions,1):
+            msg=await bot.send_poll(chat_id=chat_id,question=f"Q{n}/{len(questions)}  {q['question']}",
+                                    options=q["options"],type="quiz",
+                                    correct_option_id=q["correct_index"],is_anonymous=False)
+            save_poll(msg.poll.id,chat_id,topic,q["question"],q["correct_index"],q.get("explanation",""))
+            if n<len(questions): await asyncio.sleep(.8)
+        await status.edit_text(f"✅ {len(questions)} scheduled polls भेज दिए!\n📚 {topic}\n⏱️ कोई timer नहीं है।")
+    except Exception as e:
+        log.exception("Scheduled poll failed")
+        try: await status.edit_text(f"❌ Scheduled Poll error:\n{str(e)[:1000]}")
+        except Exception: pass
+
+async def scheduler_loop(bot):
+    log.info("Daily scheduler started: Asia/Kolkata")
+    while True:
+        try:
+            for row in due_schedules():
+                asyncio.create_task(run_scheduled_poll(bot,row))
+        except Exception: log.exception("Scheduler loop error")
+        await asyncio.sleep(20)
+
+async def scheduler_post_init(app):
+    global scheduler_task
+    scheduler_task=asyncio.create_task(scheduler_loop(app.bot))
+
+async def scheduler_post_shutdown(app):
+    global scheduler_task
+    if scheduler_task:
+        scheduler_task.cancel()
+        try: await scheduler_task
+        except asyncio.CancelledError: pass
+        scheduler_task=None
+
+async def schedule_cmd(update,context):
+    if not await chat_admin(update):
+        await update.effective_message.reply_text("❌ Schedule बनाने के लिए group admin होना जरूरी है."); return
+    args=list(context.args)
+    if len(args)<2:
+        await update.effective_message.reply_text("उदाहरण:\n/shedulear 21:00 कोशिका 5\n🕘 समय IST में होगा.\n⏱️ Poll में timer नहीं होगा."); return
+    hm=args[0]
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d",hm):
+        await update.effective_message.reply_text("❌ Time format HH:MM रखें. उदाहरण: /shedulear 21:00 कोशिका 5"); return
+    count=5
+    if args[-1].isdigit():
+        count=max(1,min(50,int(args[-1]))); args=args[:-1]
+    topic=" ".join(args[1:]).strip() or "NEET Biology"
+    sid=add_schedule(update.effective_chat.id,update.effective_user.id,hm,topic,count)
+    await update.effective_message.reply_text(f"✅ Schedule #{sid} बन गया!\n🕘 रोज़ {hm} IST\n📚 {topic}\n📝 {count} questions\n⏱️ कोई timer नहीं\n\nबंद करें: /sheduleardel {sid}")
+
+async def schedule_list_cmd(update,context):
+    if not await chat_admin(update):
+        await update.effective_message.reply_text("❌ केवल group admin."); return
+    rows=list_schedules(update.effective_chat.id)
+    if not rows: await update.effective_message.reply_text("📭 कोई schedule नहीं है."); return
+    await update.effective_message.reply_text("🗓️ Schedules (IST):\n"+"\n".join(
+        f"#{r['id']} • {r['time_hm']} • {r['topic']} • {r['count']} Q" for r in rows))
+
+async def schedule_delete_cmd(update,context):
+    if not await chat_admin(update):
+        await update.effective_message.reply_text("❌ केवल group admin."); return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("उदाहरण: /sheduleardel 1"); return
+    sid=int(context.args[0])
+    await update.effective_message.reply_text(
+        f"🗑️ Schedule #{sid} हटा दिया गया." if delete_schedule(update.effective_chat.id,sid)
+        else f"❌ Schedule #{sid} नहीं मिला.")
 
 # ---------------- COMMANDS ----------------
 
@@ -386,7 +507,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/leaderboardar — Top 10\n"
         "/profilear — आपकी progress\n"
         "/resumear — अधूरा quiz जारी करें\n"
-        "/pdfar — PDF भेजें → 90 NEET Bio polls\n"
+        "/pdfar — PDF भेजें → default 50 NEET Bio polls\n"
         "/neet720ar — 180-question NEET pattern test\n"
         "/helpar — पूरी मदद"
     )
@@ -426,15 +547,27 @@ async def quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         topic = "जीव विज्ञान"
 
     await update.message.reply_text(
-        f"⏳ AI {topic} पर {count} प्रश्न बना रहा है..."
+        f"⏳ AI {topic} पर {count} प्रश्न बना रहा है...\n"
+        f"⏱️ हर प्रश्न के लिए 30 सेकंड।"
     )
     try:
         questions = []
-        # Generate in small batches to reduce malformed large JSON responses.
+        # Small batches reduce malformed JSON and allow retrying one failed batch.
         for start_i in range(0, count, 5):
             batch = min(5, count - start_i)
-            questions.extend(await generate_questions(topic, batch))
-        save_quiz(update.effective_user.id, topic, questions)
+            for attempt in range(3):
+                try:
+                    part = await generate_questions(topic, batch)
+                    if len(part) >= batch:
+                        questions.extend(part[:batch])
+                        break
+                except Exception as e:
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(1)
+        if len(questions) < count:
+            raise ValueError(f"AI ने केवल {len(questions)}/{count} questions दिए.")
+        save_quiz(update.effective_user.id, topic, questions[:count])
         await send_next_inline_question(update, context, update.effective_user.id)
     except Exception as e:
         await update.message.reply_text(
@@ -442,16 +575,45 @@ async def quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def chapter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Same AI engine, with explicit chapter wording.
     if not context.args:
-        await update.message.reply_text(
-            "उदाहरण: /chapterar कोशिका 10"
-        )
+        await update.message.reply_text("उदाहरण: /chapterar कोशिका 10")
         return
     await quiz_cmd(update, context)
 
+async def _quiz_timeout(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    user_id = data["user_id"]
+    expected_index = data["index"]
+    row = get_quiz(user_id)
+    if not row or row["current_index"] != expected_index:
+        return
+
+    questions = json.loads(row["questions_json"])
+    if expected_index >= len(questions):
+        return
+
+    q = questions[expected_index]
+    update_quiz(user_id, expected_index + 1, row["score"])
+    await context.bot.send_message(
+        chat_id=data["chat_id"],
+        text=f"⏰ समय समाप्त!\nसही उत्तर: {chr(65+q['correct_index'])}) "
+             f"{q['options'][q['correct_index']]}\n\n💡 {q.get('explanation','')}"
+    )
+
+    new_row = get_quiz(user_id)
+    if new_row and new_row["current_index"] < len(questions):
+        await send_next_inline_question(
+            data["chat_id"], context, user_id
+        )
+    elif new_row:
+        await context.bot.send_message(
+            chat_id=data["chat_id"],
+            text=f"🏁 Quiz पूरा!\n🏆 Score: {new_row['score']}\n"
+                 f"📚 {new_row['topic']}\nकुल प्रश्न: {len(questions)}"
+        )
+        clear_quiz(user_id)
+
 async def send_next_inline_question(target, context, user_id=None):
-    """Send the next interactive question for an Update or CallbackQuery."""
     if user_id is None:
         user_id = getattr(getattr(target, "effective_user", None), "id", None)
         if user_id is None:
@@ -467,26 +629,68 @@ async def send_next_inline_question(target, context, user_id=None):
         return
 
     q = questions[i]
-    buttons = [
-        [InlineKeyboardButton(
-            f"{chr(65+j)}) {opt}",
-            callback_data=f"ans:{i}:{j}"
-        )]
-        for j, opt in enumerate(q["options"])
-    ]
+    buttons = [[InlineKeyboardButton(
+        f"{chr(65+j)}) {opt}", callback_data=f"ans:{i}:{j}"
+    )] for j, opt in enumerate(q["options"])]
     text = (
         f"📝 प्रश्न {i+1}/{len(questions)}\n"
-        f"📚 {row['topic']}\n\n{q['question']}"
+        f"📚 {row['topic']}\n"
+        f"⏱️ 30 सेकंड\n\n{q['question']}"
     )
 
     if getattr(target, "message", None):
-        await target.message.reply_text(
+        sent = await target.message.reply_text(
             text, reply_markup=InlineKeyboardMarkup(buttons)
         )
+        chat_id = target.effective_chat.id
+    elif getattr(target, "effective_message", None):
+        sent = await target.effective_message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        chat_id = target.effective_chat.id
     else:
-        await target.effective_message.reply_text(
-            text, reply_markup=InlineKeyboardMarkup(buttons)
+        sent = await context.bot.send_message(
+            chat_id=target if isinstance(target, int) else user_id,
+            text=text, reply_markup=InlineKeyboardMarkup(buttons)
         )
+        chat_id = sent.chat_id
+
+    old = quiz_timer_tasks.pop(user_id, None)
+    if old:
+        old.cancel()
+    task = asyncio.create_task(
+        _quiz_timeout_after_30(context, user_id, i, chat_id)
+    )
+    quiz_timer_tasks[user_id] = task
+
+async def _quiz_timeout_after_30(context, user_id, expected_index, chat_id):
+    try:
+        await asyncio.sleep(30)
+        row = get_quiz(user_id)
+        if not row or row["current_index"] != expected_index:
+            return
+        questions = json.loads(row["questions_json"])
+        q = questions[expected_index]
+        update_quiz(user_id, expected_index + 1, row["score"])
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⏰ 30 सेकंड पूरे!\n"
+                 f"सही उत्तर: {chr(65+q['correct_index'])}) "
+                 f"{q['options'][q['correct_index']]}\n\n"
+                 f"💡 {q.get('explanation','')}"
+        )
+        new_row = get_quiz(user_id)
+        if new_row and new_row["current_index"] < len(questions):
+            await send_next_inline_question(chat_id, context, user_id)
+        elif new_row:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🏁 Quiz पूरा!\n🏆 Score: {new_row['score']}\n"
+                     f"📚 {new_row['topic']}\nकुल प्रश्न: {len(questions)}"
+            )
+            clear_quiz(user_id)
+    finally:
+        quiz_timer_tasks.pop(user_id, None)
 
 async def inline_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -507,6 +711,10 @@ async def inline_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("यह प्रश्न पहले ही process हो चुका है.", show_alert=True)
         return
 
+    old = quiz_timer_tasks.pop(query.from_user.id, None)
+    if old:
+        old.cancel()
+
     q = questions[i]
     correct = q["correct_index"]
     ok = chosen == correct
@@ -519,8 +727,7 @@ async def inline_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_result(query.from_user.id, row["topic"], 1 if ok else 0, 0 if ok else 1)
 
     await query.edit_message_text(
-        f"{result}\n\n💡 {explanation}\n\n"
-        f"📊 Current score: {score}"
+        f"{result}\n\n💡 {explanation}\n\n📊 Current score: {score}"
     )
 
     new_row = get_quiz(query.from_user.id)
@@ -529,12 +736,12 @@ async def inline_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if new_row["current_index"] >= len(questions2):
             await query.message.reply_text(
                 f"🏁 Quiz पूरा!\n🏆 Score: {new_row['score']}\n"
-                f"📚 {new_row['topic']}\n"
-                f"कुल प्रश्न: {len(questions2)}"
+                f"📚 {new_row['topic']}\nकुल प्रश्न: {len(questions2)}"
             )
             clear_quiz(query.from_user.id)
         else:
             await send_next_inline_question(query, context, query.from_user.id)
+
 
 async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
@@ -612,58 +819,46 @@ def make_multi_poll_prompt(topic, count):
 """
 
 async def generate_poll_questions(topic, count, source_text=""):
-    """
-    Generate `count` unique questions. If the source contains only a small
-    number of original questions (e.g. 22), generate additional questions from
-    the source concepts rather than requiring 90 literal source questions.
-    """
-    clean = []
-    seen = set()
+    """Generate exactly count unique poll questions, refilling duplicates."""
+    clean, seen = [], set()
     attempts = 0
-    max_attempts = 20
-
-    # Give the model a compact source context when available.
-    source_hint = source_text[:120000] if source_text else ""
+    max_attempts = max(8, count // 3 + 6)
 
     while len(clean) < count and attempts < max_attempts:
         remaining = count - len(clean)
-        batch_count = min(max(remaining + 8, 12), 20)
+        batch = min(8, remaining)
 
-        prompt = make_multi_poll_prompt(topic, batch_count)
-        if source_hint:
-            prompt += f"""
+        prompt = make_multi_poll_prompt(topic, batch)
+        if source_text:
+            prompt += (
+                "\n\nSOURCE MATERIAL:\n"
+                + source_text[:100000]
+                + "\n\nCreate new questions from the concepts in this material; "
+                  "do not copy source questions verbatim."
+            )
 
-SOURCE PDF CONTENT:
-{source_hint}
-
-IMPORTANT:
-- Generate NEW questions from the concepts in this source.
-- The source may contain only 22 original questions; that does NOT limit the
-  requested output. Create additional original NEET-level questions by testing
-  different concepts, facts, relationships, examples and applications present
-  in the source.
-- Do not copy a source question verbatim.
-- Do not repeat the same concept/fact with trivial wording changes.
-"""
-
-        raw = await asyncio.to_thread(ask_ai, prompt, SYSTEM, True)
-        data = parse_json(raw)
+        try:
+            raw = await asyncio.to_thread(
+                ask_ai, prompt, SYSTEM, True
+            )
+            data = parse_json(raw)
+        except Exception:
+            attempts += 1
+            await asyncio.sleep(0.8)
+            continue
 
         if isinstance(data, list):
             for q in data:
                 if not isinstance(q, dict):
                     continue
-                options = q.get("options")
                 try:
                     idx = int(q.get("correct_index", -1))
                 except Exception:
                     idx = -1
+                opts = q.get("options")
                 question = str(q.get("question", "")).strip()
-
                 if (
-                    question
-                    and isinstance(options, list)
-                    and len(options) == 4
+                    question and isinstance(opts, list) and len(opts) == 4
                     and idx in (0, 1, 2, 3)
                 ):
                     key = " ".join(question.lower().split())
@@ -671,57 +866,40 @@ IMPORTANT:
                         seen.add(key)
                         clean.append({
                             "question": question[:300],
-                            "options": [str(x)[:100] for x in options],
+                            "options": [str(x)[:100] for x in opts],
                             "correct_index": idx,
                             "explanation": str(q.get("explanation", ""))[:900],
                         })
                         if len(clean) >= count:
                             break
-
         attempts += 1
-
-    if len(clean) < count:
-        # Do not pretend 90 were produced. Return the maximum valid unique set
-        # so the caller can post what is actually available.
-        return clean
 
     return clean[:count]
 
+
+
 async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /pollar विषय 5  -> 5 separate native Telegram Quiz Polls.
-    Polls have NO open_period and NO close_date, so they have no timer.
-    Anyone in the group can answer.
-    """
     ensure_user(update.effective_user)
-
     args = list(context.args)
-    count = 1
+    count = 5
 
-    # Last argument can be the requested number of polls.
-    if args:
-        try:
-            possible_count = int(args[-1])
-            if 1 <= possible_count <= 20:
-                count = possible_count
-                args = args[:-1]
-        except ValueError:
-            pass
+    if args and args[-1].isdigit():
+        count = max(1, min(50, int(args[-1])))
+        args = args[:-1]
 
     topic = " ".join(args).strip() if args else "NEET Biology"
 
-    if update.effective_chat.type == "private" and count > 5:
-        # Keep private chat from being flooded accidentally.
-        count = 5
-
     status = await update.effective_message.reply_text(
-        f"🤖 {topic} पर {count} NEET Quiz Poll "
-        f"{'बना रहा हूँ' if count == 1 else 'बना रहा हूँ'}...\n"
+        f"🤖 {topic} पर {count} Quiz Polls बना रहा हूँ...\n"
         f"⏱️ कोई timer नहीं होगा।"
     )
-
     try:
         questions = await generate_poll_questions(topic, count)
+        if len(questions) < count:
+            raise ValueError(
+                f"AI से {len(questions)}/{count} unique questions ही बने। "
+                f"दोबारा प्रयास करें या दूसरा topic दें."
+            )
 
         for n, q in enumerate(questions, 1):
             msg = await context.bot.send_poll(
@@ -731,42 +909,19 @@ async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 type="quiz",
                 correct_option_id=q["correct_index"],
                 is_anonymous=False,
-                # IMPORTANT:
-                # No open_period and no close_date.
-                # The poll remains open and anyone can answer.
             )
-
-            save_poll(
-                msg.poll.id,
-                update.effective_chat.id,
-                topic,
-                q["question"],
-                q["correct_index"],
-                q.get("explanation", ""),
-            )
-
-            # Avoid sending all polls in the exact same millisecond.
+            save_poll(msg.poll.id, update.effective_chat.id, topic,
+                      q["question"], q["correct_index"], q.get("explanation",""))
             if n < len(questions):
                 await asyncio.sleep(0.8)
 
         await status.edit_text(
-            f"✅ {count} Quiz Poll {'बन गया' if count == 1 else 'बन गए'}!\n"
-            f"📚 विषय: {topic}\n"
-            f"👥 Group में कोई भी member answer कर सकता है।\n"
-            f"⏱️ कोई timer नहीं है।\n"
-            f"💬 Explanation group में नहीं आएगा; "
-            f"जिसने answer किया उसे DM में भेजने की कोशिश होगी।"
+            f"✅ {count} Quiz Polls भेज दिए गए!\n"
+            f"📚 {topic}\n⏱️ कोई timer नहीं है।"
         )
-
     except Exception as e:
         log.exception("Multi-poll generation failed")
-        err = str(e)
-        if "not enough rights" in err.lower() or "CHAT_ADMIN_REQUIRED" in err:
-            err += (
-                "\n\n⚠️ Bot को group में Polls भेजने की permission दें "
-                "(जरूरत हो तो Admin बनाएं)."
-            )
-        await status.edit_text(f"❌ Poll error:\n{err[:1400]}")
+        await status.edit_text(f"❌ Poll error:\n{str(e)[:1400]}")
 
 
 async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -819,271 +974,132 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def pdf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    count = 50
+    if context.args and context.args[-1].isdigit():
+        count = max(1, min(90, int(context.args[-1])))
+    pdf_requests[update.effective_chat.id] = count
     await update.message.reply_text(
-        "📚 PDF भेजें।\n\n"
-        "मैं PDF से NEET Biology के प्रश्न तैयार करके "
-        "Telegram Quiz Poll के रूप में इसी chat/group में भेजूँगा।\n\n"
-        "🔢 अधिकतम 90 प्रश्न\n"
-        "🧠 NEET level\n"
-        "🧬 Assertion-Reason / कथन-आधारित प्रश्न भी\n"
-        "⏱️ Poll में कोई timer नहीं होगा।"
+        f"📚 PDF भेजें। मैं उससे {count} NEET Biology Quiz Polls बनाऊँगा.\n\n"
+        f"🧠 NEET level\n🧬 Assertion-Reason / कथन-आधारित भी\n"
+        f"⏱️ Poll में कोई timer नहीं होगा।\n\n"
+        f"बदलना हो तो: /pdfar 30, /pdfar 50 या /pdfar 90"
     )
 
-def make_pdf_question_prompt(book_text, count):
-    return f"""
-तुम NEET Biology question setter हो।
+async def generate_pdf_questions(book_text, count=50):
+    """Generate exactly count unique questions from PDF concepts."""
+    clean, seen = [], set()
+    attempts = 0
+    max_attempts = max(10, count // 3 + 8)
 
-नीचे किसी Biology book/PDF का text दिया गया है।
-इसी दिए गए material के concepts पर आधारित {count} मूल NEET-level MCQ बनाओ।
-किसी पुस्तक के लंबे वाक्य copy मत करो; प्रश्न को अपने शब्दों में बनाओ।
+    while len(clean) < count and attempts < max_attempts:
+        remaining = count - len(clean)
+        batch = min(8, remaining)
 
-Question mix:
-- लगभग 50% normal conceptual MCQ
-- लगभग 25% Assertion-Reason / कथन-कारण
-- लगभग 25% statement-based / multiple-statement MCQ
-
-सिर्फ JSON array दो:
-[
-  {{
-    "question": "प्रश्न",
-    "options": ["A", "B", "C", "D"],
-    "correct_index": 0,
-    "explanation": "छोटी NCERT/NEET स्तर की व्याख्या"
-  }}
-]
-
-Assertion-Reason के लिए options इस प्रकार रखो:
-A) A और R दोनों सही हैं तथा R, A की सही व्याख्या है
-B) A और R दोनों सही हैं लेकिन R, A की सही व्याख्या नहीं है
-C) A सही है लेकिन R गलत है
-D) A गलत है लेकिन R सही है
-
-नियम:
-- ठीक {count} प्रश्न
-- हर प्रश्न में ठीक 4 options
-- केवल एक सही उत्तर
-- NEET Biology level
-- हिंदी
-- दिए गए PDF के concepts से बाहर की मनगढ़ंत जानकारी नहीं
-- duplicate questions नहीं
-- question और options बहुत लंबे नहीं हों
-
-PDF TEXT:
-{book_text}
-"""
-
-async def generate_pdf_questions(book_text, count=90):
-    questions = []
-    # Generate small batches so large PDFs/JSON responses are less likely to fail.
-    for offset in range(0, count, 10):
-        batch_count = min(10, count - offset)
-        raw = await asyncio.to_thread(
-            ask_ai,
-            make_pdf_question_prompt(book_text, batch_count),
-            SYSTEM,
-            True
-        )
-        data = parse_json(raw)
-        if not isinstance(data, list):
-            raise ValueError("AI ने question list नहीं दी.")
-
-        for q in data:
-            try:
-                idx = int(q.get("correct_index", -1))
-            except Exception:
-                idx = -1
-            if (
-                isinstance(q, dict)
-                and isinstance(q.get("question"), str)
-                and isinstance(q.get("options"), list)
-                and len(q["options"]) == 4
-                and idx in (0, 1, 2, 3)
-            ):
-                questions.append({
-                    "question": q["question"][:300],
-                    "options": [str(x)[:100] for x in q["options"]],
-                    "correct_index": idx,
-                    "explanation": str(q.get("explanation", ""))[:700],
-                })
-        if len(questions) >= count:
-            break
-
-    if len(questions) < count:
-        raise ValueError(
-            f"PDF से केवल {len(questions)}/{count} valid questions बन पाए."
+        prompt = make_pdf_question_prompt(book_text[:180000], batch)
+        prompt += (
+            "\n\nIMPORTANT: The PDF may contain fewer original questions than "
+            "the requested output. Use its concepts, facts and relationships "
+            "to create NEW NEET-level questions. Do not copy questions verbatim "
+            "and do not repeat the same fact with trivial wording changes."
         )
 
-    # Remove exact duplicate questions while keeping order.
-    seen = set()
-    unique = []
-    for q in questions:
-        key = q["question"].strip().lower()
-        if key not in seen:
-            seen.add(key)
-            unique.append(q)
-    if len(unique) < count:
-        raise ValueError(
-            f"Duplicate हटाने के बाद {len(unique)}/{count} questions बचे."
-        )
-    return unique[:count]
-
-async def post_pdf_polls(chat_id, questions, bot, status_message=None):
-    total = len(questions)
-    for i, q in enumerate(questions, 1):
-        msg = await bot.send_poll(
-            chat_id=chat_id,
-            question=f"Q{i}/{total}  {q['question']}",
-            options=q["options"],
-            type="quiz",
-            correct_option_id=q["correct_index"],
-            is_anonymous=False,
-            # IMPORTANT: no open_period and no close_date.
-            # Therefore there is NO TIMER on these polls.
-        )
-        save_poll(
-            msg.poll.id,
-            chat_id,
-            "PDF • NEET Biology",
-            q["question"],
-            q["correct_index"],
-            q.get("explanation", ""),
-        )
-
-        # Small delay prevents flooding Telegram with 90 polls at once.
-        await asyncio.sleep(0.8)
-
-    if status_message:
-        await status_message.edit_text(
-            f"✅ पूरा! PDF से {total} NEET Biology Quiz Polls group/chat में डाल दिए गए.\n"
-            f"🧠 Normal + कथन-आधारित + Assertion-Reason\n"
-            f"⏱️ सभी polls में कोई timer नहीं है."
-        )
-
-
-async def post_pdf_polls(chat_id, questions, bot, status_message=None):
-    """Send generated PDF questions as untimed native Telegram quiz polls."""
-    total = len(questions)
-
-    for i, q in enumerate(questions, 1):
-        msg = await bot.send_poll(
-            chat_id=chat_id,
-            question=f"Q{i}/{total}  {q['question']}",
-            options=q["options"],
-            type="quiz",
-            correct_option_id=q["correct_index"],
-            is_anonymous=False,
-            # No open_period / close_date = no timer.
-        )
-
-        save_poll(
-            msg.poll.id,
-            chat_id,
-            "PDF • NEET Biology",
-            q["question"],
-            q["correct_index"],
-            q.get("explanation", ""),
-        )
-
-        if i < total:
+        try:
+            raw = await asyncio.to_thread(
+                ask_ai, prompt, SYSTEM, True
+            )
+            data = parse_json(raw)
+        except Exception:
+            attempts += 1
             await asyncio.sleep(0.8)
+            continue
 
+        if isinstance(data, list):
+            for q in data:
+                if not isinstance(q, dict):
+                    continue
+                try:
+                    idx = int(q.get("correct_index", -1))
+                except Exception:
+                    idx = -1
+                opts = q.get("options")
+                question = str(q.get("question", "")).strip()
+                if (
+                    question and isinstance(opts, list) and len(opts) == 4
+                    and idx in (0, 1, 2, 3)
+                ):
+                    key = " ".join(question.lower().split())
+                    if key not in seen:
+                        seen.add(key)
+                        clean.append({
+                            "question": question[:300],
+                            "options": [str(x)[:100] for x in opts],
+                            "correct_index": idx,
+                            "explanation": str(q.get("explanation", ""))[:900],
+                        })
+                        if len(clean) >= count:
+                            break
+        attempts += 1
+
+    return clean[:count]
+
+
+
+async def post_pdf_polls(chat_id, questions, bot, status_message=None):
+    total=len(questions)
+    for i,q in enumerate(questions,1):
+        msg=await bot.send_poll(
+            chat_id=chat_id,
+            question=f"Q{i}/{total}  {q['question']}",
+            options=q["options"], type="quiz",
+            correct_option_id=q["correct_index"], is_anonymous=False
+        )
+        save_poll(msg.poll.id,chat_id,"PDF • NEET Biology",
+                  q["question"],q["correct_index"],q.get("explanation",""))
+        if i<total: await asyncio.sleep(0.8)
     if status_message:
         await status_message.edit_text(
-            f"✅ {total} PDF-based NEET Biology Quiz Polls भेज दिए गए।\n"
-            f"⏱️ कोई timer नहीं है।"
+            f"✅ {total} PDF Quiz Polls भेज दिए गए।\n⏱️ कोई timer नहीं है।"
         )
 
 async def pdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.document:
-        return
-    if fitz is None:
-        await update.message.reply_text("❌ PDF package उपलब्ध नहीं है.")
-        return
+    if not update.message or not update.message.document: return
+    if pymupdf is None:
+        await update.message.reply_text("❌ PDF package उपलब्ध नहीं है."); return
 
-    doc = update.message.document
-    if doc.file_size and doc.file_size > 15 * 1024 * 1024:
-        await update.message.reply_text(
-            "❌ PDF 15 MB से छोटी रखें."
-        )
-        return
-
-    status = await update.message.reply_text(
-        "📄 PDF मिल गई.\n"
-        "🔍 Text पढ़ रहा हूँ और NEET Biology questions तैयार कर रहा हूँ...\n"
-        "⏳ 90 questions में थोड़ा समय लग सकता है."
+    count=pdf_requests.pop(update.effective_chat.id, 50)
+    status=await update.message.reply_text(
+        f"📄 PDF मिल गई। {count} questions तैयार कर रहा हूँ..."
     )
-
-    path = None
+    path=None
     try:
-        tg = await doc.get_file()
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-            path = f.name
+        tg=await update.message.document.get_file()
+        with tempfile.NamedTemporaryFile(suffix=".pdf",delete=False) as f:
+            path=f.name
         await tg.download_to_drive(path)
-
-        pdf = fitz.open(path)
-        pages_text = []
-        for page in pdf:
-            pages_text.append(page.get_text())
+        pdf=pymupdf.open(path)
+        text="\n".join(page.get_text() for page in pdf).strip()
         pdf.close()
-
-        text = "\n".join(pages_text).strip()
         if not text:
+            await status.edit_text("❌ PDF में selectable text नहीं मिला."); return
+        await status.edit_text(
+            f"🧠 PDF पढ़ ली। अब {count} NEET Biology questions बन रहे हैं..."
+        )
+        questions=await generate_pdf_questions(text[:180000],count)
+        if len(questions)<count:
             await status.edit_text(
-                "❌ PDF में selectable text नहीं मिला.\n"
-                "Scanned/image-only PDF के लिए OCR जोड़ना होगा."
+                f"⚠️ {len(questions)}/{count} unique questions बने। "
+                f"अभी उपलब्ध questions भेज रहा हूँ..."
             )
-            return
-
-        # Keep enough context for a book while avoiding an enormous API request.
-        # The bot generates questions from the extracted material; it does not
-        # reproduce the book text in Telegram.
-        text = text[:180000]
-
-        await status.edit_text(
-            "🧠 PDF पढ़ ली गई.\n"
-            "अब 90 NEET Biology questions बन रहे हैं...\n"
-            "कथन-कारण और statement-based questions भी शामिल होंगे."
-        )
-
-        questions = await generate_pdf_questions(text, 90)
-
-        await status.edit_text(
-            "📊 90 questions तैयार हैं.\n"
-            "अब इसी group/chat में Quiz Polls भेजे जा रहे हैं...\n"
-            "⏱️ कोई poll timer नहीं है."
-        )
-
         if not questions:
-            await status.edit_text(
-                "❌ PDF से valid NEET questions नहीं बन पाए। "
-                "कृपया text वाली Biology PDF भेजें."
-            )
-            return
-
-        if len(questions) < 90:
-            await status.edit_text(
-                f"⚠️ PDF के concepts से {len(questions)}/90 unique questions "
-                f"तैयार हुए। अब उपलब्ध {len(questions)} polls भेज रहा हूँ..."
-            )
-
-        await post_pdf_polls(
-            update.effective_chat.id,
-            questions,
-            context.bot,
-            status
-        )
-
+            await status.edit_text("❌ PDF से valid questions नहीं बने."); return
+        await post_pdf_polls(update.effective_chat.id,questions,context.bot,status)
     except Exception as e:
         log.exception("PDF pipeline failed")
-        try:
-            await status.edit_text(
-                f"❌ PDF → Poll error:\n{str(e)[:1200]}"
-            )
-        except Exception:
-            pass
+        try: await status.edit_text(f"❌ PDF → Poll error:\n{str(e)[:1200]}")
+        except: pass
     finally:
-        if path:
-            Path(path).unlink(missing_ok=True)
+        if path: Path(path).unlink(missing_ok=True)
+
 
 async def neet720_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -1154,7 +1170,10 @@ def build_app():
         raise RuntimeError("TELEGRAM_BOT_TOKEN missing in Railway Variables.")
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (Application.builder().token(BOT_TOKEN)
+           .post_init(scheduler_post_init)
+           .post_shutdown(scheduler_post_shutdown)
+           .build())
 
     app.add_handler(CommandHandler("startar", start))
     app.add_handler(CommandHandler("helpar", help_cmd))
@@ -1167,6 +1186,10 @@ def build_app():
     app.add_handler(CommandHandler("resumear", resume_cmd))
     app.add_handler(CommandHandler("pdfar", pdf_cmd))
     app.add_handler(CommandHandler("neet720ar", neet720_cmd))
+    app.add_handler(CommandHandler("shedulear", schedule_cmd))
+    app.add_handler(CommandHandler("schedulear", schedule_cmd))
+    app.add_handler(CommandHandler("shedulearlistrar", schedule_list_cmd))
+    app.add_handler(CommandHandler("sheduleardel", schedule_delete_cmd))
 
     app.add_handler(CallbackQueryHandler(inline_answer, pattern=r"^ans:"))
     app.add_handler(PollAnswerHandler(poll_answer))
