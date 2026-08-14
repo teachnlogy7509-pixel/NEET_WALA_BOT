@@ -386,7 +386,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/leaderboardar — Top 10\n"
         "/profilear — आपकी progress\n"
         "/resumear — अधूरा quiz जारी करें\n"
-        "/pdfar — PDF भेजें → 90 NEET Bio polls\n"
+        "/pdfar [N] — PDF से N NEET Bio polls (max 90)\n"
         "/neet720ar — 180-question NEET pattern test\n"
         "/helpar — पूरी मदद"
     )
@@ -604,79 +604,86 @@ def make_multi_poll_prompt(topic, count):
 - NEET level
 - NCERT-केंद्रित
 - सभी प्रश्न एक-दूसरे से अलग
+- PDF में दिए गए concepts/content से नए प्रश्न बनाओ; PDF के 22 मूल प्रश्नों की संख्या को output limit मत मानो
+- एक ही तथ्य को अलग शब्दों में दोहराने से बचो
 - कथन/Assertion-Reason/Conceptual/Application प्रश्नों का अच्छा mix
 - हिंदी में
 - प्रश्न बहुत लंबे न हों
 """
 
-async def generate_poll_questions(topic, count):
+async def generate_poll_questions(topic, count, source_text=""):
     """
-    Generate at least `count` UNIQUE questions.
-    If AI returns duplicates, request extra batches instead of failing.
+    Generate `count` unique questions. If the source contains only a small
+    number of original questions (e.g. 22), generate additional questions from
+    the source concepts rather than requiring 90 literal source questions.
     """
     clean = []
     seen = set()
     attempts = 0
-    max_attempts = 12
+    max_attempts = 20
+
+    # Give the model a compact source context when available.
+    source_hint = source_text[:120000] if source_text else ""
 
     while len(clean) < count and attempts < max_attempts:
         remaining = count - len(clean)
+        batch_count = min(max(remaining + 8, 12), 20)
 
-        # Ask for extra questions so duplicates do not make the final batch short.
-        batch_count = min(max(remaining + 4, 8), 15)
+        prompt = make_multi_poll_prompt(topic, batch_count)
+        if source_hint:
+            prompt += f"""
 
-        raw = await asyncio.to_thread(
-            ask_ai, make_multi_poll_prompt(topic, batch_count), SYSTEM, True
-        )
+SOURCE PDF CONTENT:
+{source_hint}
+
+IMPORTANT:
+- Generate NEW questions from the concepts in this source.
+- The source may contain only 22 original questions; that does NOT limit the
+  requested output. Create additional original NEET-level questions by testing
+  different concepts, facts, relationships, examples and applications present
+  in the source.
+- Do not copy a source question verbatim.
+- Do not repeat the same concept/fact with trivial wording changes.
+"""
+
+        raw = await asyncio.to_thread(ask_ai, prompt, SYSTEM, True)
         data = parse_json(raw)
 
-        if not isinstance(data, list):
-            attempts += 1
-            continue
+        if isinstance(data, list):
+            for q in data:
+                if not isinstance(q, dict):
+                    continue
+                options = q.get("options")
+                try:
+                    idx = int(q.get("correct_index", -1))
+                except Exception:
+                    idx = -1
+                question = str(q.get("question", "")).strip()
 
-        for q in data:
-            if not isinstance(q, dict):
-                continue
-
-            options = q.get("options")
-            try:
-                idx = int(q.get("correct_index", -1))
-            except Exception:
-                idx = -1
-
-            question = str(q.get("question", "")).strip()
-
-            if (
-                question
-                and isinstance(options, list)
-                and len(options) == 4
-                and idx in (0, 1, 2, 3)
-            ):
-                # Normalize whitespace/case only for duplicate detection.
-                key = " ".join(question.lower().split())
-
-                if key not in seen:
-                    seen.add(key)
-                    clean.append({
-                        "question": question[:300],
-                        "options": [str(x)[:100] for x in options],
-                        "correct_index": idx,
-                        "explanation": str(
-                            q.get("explanation", "")
-                        )[:900],
-                    })
-
-                    if len(clean) >= count:
-                        break
+                if (
+                    question
+                    and isinstance(options, list)
+                    and len(options) == 4
+                    and idx in (0, 1, 2, 3)
+                ):
+                    key = " ".join(question.lower().split())
+                    if key not in seen:
+                        seen.add(key)
+                        clean.append({
+                            "question": question[:300],
+                            "options": [str(x)[:100] for x in options],
+                            "correct_index": idx,
+                            "explanation": str(q.get("explanation", ""))[:900],
+                        })
+                        if len(clean) >= count:
+                            break
 
         attempts += 1
 
     if len(clean) < count:
-        raise ValueError(
-            f"90 questions पूरे नहीं बन पाए। "
-            f"Unique valid questions: {len(clean)}/{count}. "
-            f"कृपया PDF/विषय के लिए फिर से कोशिश करें."
-        )
+        # Do not pretend 90 were produced. Return the maximum valid unique set
+        # so the caller can post what is actually available.
+        return clean
 
     return clean[:count]
 
@@ -812,164 +819,171 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def pdf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📚 PDF भेजें।\n\n"
-        "मैं PDF से NEET Biology के प्रश्न तैयार करके "
-        "Telegram Quiz Poll के रूप में इसी chat/group में भेजूँगा।\n\n"
-        "🔢 अधिकतम 90 प्रश्न\n"
+    # Usage: /pdfar 50  -> after this command upload the PDF, bot makes 50 polls.
+    count = 90
+    args = list(context.args)
+    if args and args[-1].isdigit():
+        count = max(1, min(90, int(args[-1])))
+    context.user_data["pdf_count"] = count
+    context.chat_data["pdf_count"] = count
+
+    await update.effective_message.reply_text(
+        "📚 PDF तैयार है। अब इसी chat/group में Biology PDF upload करें।\n\n"
+        f"🔢 प्रश्न: {count}\n"
         "🧠 NEET level\n"
-        "🧬 Assertion-Reason / कथन-आधारित प्रश्न भी\n"
-        "⏱️ Poll में कोई timer नहीं होगा।"
+        "🧬 Assertion-Reason / कथन-आधारित + statement-based\n"
+        "🔘 हर प्रश्न अलग Telegram Quiz Poll होगा\n"
+        "⏱️ कोई timer नहीं होगा\n\n"
+        "उदाहरण: /pdfar 50 → PDF से 50 polls"
     )
 
-def make_pdf_question_prompt(book_text, count):
+def make_pdf_question_prompt(book_text, count, previous_questions=None):
+    previous_questions = previous_questions or []
+    previous = "\n".join(
+        f"- {q}" for q in previous_questions[-80:]
+    )
+
     return f"""
-तुम NEET Biology question setter हो।
+तुम NEET Biology के expert question setter हो।
 
-नीचे किसी Biology book/PDF का text दिया गया है।
-इसी दिए गए material के concepts पर आधारित {count} मूल NEET-level MCQ बनाओ।
-किसी पुस्तक के लंबे वाक्य copy मत करो; प्रश्न को अपने शब्दों में बनाओ।
+SOURCE:
+नीचे Biology PDF/book का text दिया है। PDF में original questions कम या ज्यादा
+हो सकते हैं। Original questions की संख्या output की सीमा नहीं है।
 
-Question mix:
-- लगभग 50% normal conceptual MCQ
-- लगभग 25% Assertion-Reason / कथन-कारण
-- लगभग 25% statement-based / multiple-statement MCQ
+तुम्हारा काम: source के concepts, facts, relationships, examples और applications
+को समझकर ठीक {count} नए NEET-level MCQ बनाना।
 
-सिर्फ JSON array दो:
+महत्वपूर्ण:
+- PDF के सवालों को verbatim copy मत करो।
+- नए और अलग questions बनाओ।
+- केवल wording बदलकर वही सवाल दोबारा मत बनाओ।
+- पहले से बने questions से भी duplicate concept/question मत बनाओ।
+- PDF के बाहर की अनावश्यक जानकारी मत जोड़ो।
+- Biology/NEET level बनाए रखो।
+- लगभग 50% conceptual, 25% statement-based और 25% Assertion-Reason/कथन-कारण का mix रखो।
+- हर question में ठीक 4 options और केवल 1 correct answer हो।
+- भाषा: सरल हिंदी।
+- Output केवल valid JSON array हो।
+
+JSON format:
 [
   {{
     "question": "प्रश्न",
     "options": ["A", "B", "C", "D"],
     "correct_index": 0,
-    "explanation": "छोटी NCERT/NEET स्तर की व्याख्या"
+    "explanation": "संक्षिप्त NCERT/NEET explanation"
   }}
 ]
 
-Assertion-Reason के लिए options इस प्रकार रखो:
+Assertion-Reason के लिए:
 A) A और R दोनों सही हैं तथा R, A की सही व्याख्या है
 B) A और R दोनों सही हैं लेकिन R, A की सही व्याख्या नहीं है
 C) A सही है लेकिन R गलत है
 D) A गलत है लेकिन R सही है
 
-नियम:
-- ठीक {count} प्रश्न
-- हर प्रश्न में ठीक 4 options
-- केवल एक सही उत्तर
-- NEET Biology level
-- हिंदी
-- दिए गए PDF के concepts से बाहर की मनगढ़ंत जानकारी नहीं
-- duplicate questions नहीं
-- question और options बहुत लंबे नहीं हों
+PREVIOUSLY GENERATED QUESTIONS (इनसे duplicate मत बनाना):
+{previous}
 
-PDF TEXT:
+PDF CONTENT:
 {book_text}
 """
 
-async def generate_pdf_questions(book_text, count=90):
-    questions = []
-    # Generate small batches so large PDFs/JSON responses are less likely to fail.
-    for offset in range(0, count, 10):
-        batch_count = min(10, count - offset)
-        raw = await asyncio.to_thread(
-            ask_ai,
-            make_pdf_question_prompt(book_text, batch_count),
-            SYSTEM,
-            True
-        )
-        data = parse_json(raw)
-        if not isinstance(data, list):
-            raise ValueError("AI ने question list नहीं दी.")
 
-        for q in data:
-            try:
-                idx = int(q.get("correct_index", -1))
-            except Exception:
-                idx = -1
-            if (
-                isinstance(q, dict)
-                and isinstance(q.get("question"), str)
-                and isinstance(q.get("options"), list)
-                and len(q["options"]) == 4
-                and idx in (0, 1, 2, 3)
-            ):
+async def generate_pdf_questions(book_text, count=90):
+    """
+    Generate exactly `count` valid, non-duplicate questions when possible.
+    It keeps asking for additional batches if the AI returns duplicates or
+    fewer valid items. It never stops merely because 89/90 were unique.
+    """
+    questions = []
+    seen = set()
+    attempts = 0
+    max_attempts = 25
+
+    # Use enough source context for a book while avoiding an oversized request.
+    source = book_text[:180000]
+
+    while len(questions) < count and attempts < max_attempts:
+        remaining = count - len(questions)
+        batch = min(max(remaining, 8), 12)
+
+        previous = [q["question"] for q in questions]
+        prompt = make_pdf_question_prompt(source, batch, previous)
+
+        try:
+            raw = await asyncio.to_thread(
+                ask_ai, prompt, SYSTEM, True
+            )
+            data = parse_json(raw)
+        except Exception as e:
+            log.warning("PDF question batch failed: %s", e)
+            attempts += 1
+            continue
+
+        if isinstance(data, list):
+            for q in data:
+                if not isinstance(q, dict):
+                    continue
+                question = str(q.get("question", "")).strip()
+                options = q.get("options")
+                try:
+                    idx = int(q.get("correct_index", -1))
+                except Exception:
+                    idx = -1
+
+                if not (
+                    question and isinstance(options, list)
+                    and len(options) == 4
+                    and idx in (0, 1, 2, 3)
+                ):
+                    continue
+
+                key = re.sub(r"\s+", " ", question.lower()).strip()
+                if key in seen:
+                    continue
+
+                seen.add(key)
                 questions.append({
-                    "question": q["question"][:300],
-                    "options": [str(x)[:100] for x in q["options"]],
+                    "question": question[:300],
+                    "options": [str(x)[:100] for x in options],
                     "correct_index": idx,
-                    "explanation": str(q.get("explanation", ""))[:700],
+                    "explanation": str(q.get("explanation", ""))[:900],
                 })
-        if len(questions) >= count:
-            break
+
+                if len(questions) >= count:
+                    break
+
+        attempts += 1
 
     if len(questions) < count:
         raise ValueError(
-            f"PDF से केवल {len(questions)}/{count} valid questions बन पाए."
+            f"PDF से {count} में से केवल {len(questions)} unique valid "
+            f"questions बन पाए। फिर से प्रयास करें या कम संख्या लिखें, "
+            f"जैसे /pdfar 50."
         )
 
-    # Remove exact duplicate questions while keeping order.
-    seen = set()
-    unique = []
-    for q in questions:
-        key = q["question"].strip().lower()
-        if key not in seen:
-            seen.add(key)
-            unique.append(q)
-    if len(unique) < count:
-        raise ValueError(
-            f"Duplicate हटाने के बाद {len(unique)}/{count} questions बचे."
-        )
-    return unique[:count]
+    return questions[:count]
 
-async def post_pdf_polls(chat_id, questions, bot, status_message=None):
-    total = len(questions)
-    for i, q in enumerate(questions, 1):
-        msg = await bot.send_poll(
-            chat_id=chat_id,
-            question=f"Q{i}/{total}  {q['question']}",
-            options=q["options"],
-            type="quiz",
-            correct_option_id=q["correct_index"],
-            is_anonymous=False,
-            # IMPORTANT: no open_period and no close_date.
-            # Therefore there is NO TIMER on these polls.
-        )
-        save_poll(
-            msg.poll.id,
-            chat_id,
-            "PDF • NEET Biology",
-            q["question"],
-            q["correct_index"],
-            q.get("explanation", ""),
-        )
-
-        # Small delay prevents flooding Telegram with 90 polls at once.
-        await asyncio.sleep(0.8)
-
-    if status_message:
-        await status_message.edit_text(
-            f"✅ पूरा! PDF से {total} NEET Biology Quiz Polls group/chat में डाल दिए गए.\n"
-            f"🧠 Normal + कथन-आधारित + Assertion-Reason\n"
-            f"⏱️ सभी polls में कोई timer नहीं है."
-        )
 
 async def pdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.document:
         return
     if fitz is None:
-        await update.message.reply_text("❌ PDF package उपलब्ध नहीं है.")
+        await update.message.reply_text("❌ PDF reader package उपलब्ध नहीं है.")
         return
 
     doc = update.message.document
     if doc.file_size and doc.file_size > 15 * 1024 * 1024:
-        await update.message.reply_text(
-            "❌ PDF 15 MB से छोटी रखें."
-        )
+        await update.message.reply_text("❌ PDF 15 MB से छोटी रखें.")
         return
 
+    count = int(context.chat_data.pop("pdf_count", None) or context.user_data.pop("pdf_count", 90))
+
     status = await update.message.reply_text(
-        "📄 PDF मिल गई.\n"
-        "🔍 Text पढ़ रहा हूँ और NEET Biology questions तैयार कर रहा हूँ...\n"
-        "⏳ 90 questions में थोड़ा समय लग सकता है."
+        f"📄 PDF मिल गई।\n"
+        f"🔍 PDF पढ़ रहा हूँ...\n"
+        f"🧠 {count} NEET Biology questions तैयार होंगे...\n"
+        f"⏱️ Polls में कोई timer नहीं होगा।"
     )
 
     path = None
@@ -980,36 +994,30 @@ async def pdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tg.download_to_drive(path)
 
         pdf = fitz.open(path)
-        pages_text = []
-        for page in pdf:
-            pages_text.append(page.get_text())
+        text = "\n".join(page.get_text() for page in pdf).strip()
         pdf.close()
 
-        text = "\n".join(pages_text).strip()
         if not text:
             await status.edit_text(
-                "❌ PDF में selectable text नहीं मिला.\n"
-                "Scanned/image-only PDF के लिए OCR जोड़ना होगा."
+                "❌ इस PDF में selectable text नहीं मिला।\n"
+                "यह scanned/image PDF हो सकती है; OCR की जरूरत होगी."
             )
             return
 
-        # Keep enough context for a book while avoiding an enormous API request.
-        # The bot generates questions from the extracted material; it does not
-        # reproduce the book text in Telegram.
         text = text[:180000]
 
         await status.edit_text(
-            "🧠 PDF पढ़ ली गई.\n"
-            "अब 90 NEET Biology questions बन रहे हैं...\n"
-            "कथन-कारण और statement-based questions भी शामिल होंगे."
+            f"🧠 PDF पढ़ ली गई।\n"
+            f"अब {count} अलग NEET Biology questions बनाए जा रहे हैं...\n"
+            f"कथन-कारण + statement-based भी शामिल होंगे."
         )
 
-        questions = await generate_pdf_questions(text, 90)
+        questions = await generate_pdf_questions(text, count)
 
         await status.edit_text(
-            "📊 90 questions तैयार हैं.\n"
-            "अब इसी group/chat में Quiz Polls भेजे जा रहे हैं...\n"
-            "⏱️ कोई poll timer नहीं है."
+            f"📊 {len(questions)} questions तैयार हैं।\n"
+            "अब group/chat में Quiz Polls भेजे जा रहे हैं...\n"
+            "⏱️ कोई timer नहीं है।"
         )
 
         await post_pdf_polls(
@@ -1022,14 +1030,13 @@ async def pdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("PDF pipeline failed")
         try:
-            await status.edit_text(
-                f"❌ PDF → Poll error:\n{str(e)[:1200]}"
-            )
+            await status.edit_text(f"❌ PDF → Poll error:\n{str(e)[:1400]}")
         except Exception:
             pass
     finally:
         if path:
             Path(path).unlink(missing_ok=True)
+
 
 async def neet720_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -1120,7 +1127,7 @@ def build_app():
     # Telegram command handlers normally use lowercase command names.
     # This Regex handler also accepts the exact /ASHISH trigger in groups.
     app.add_handler(MessageHandler(
-        filters.Regex(r"^/ASHISH(?:@\\w+)?(?:\\s+.*)?$"),
+        filters.Regex(r"^/ASHISH(?:@\w+)?(?:\s+.*)?$"),
         ashish_cmd
     ))
     app.add_handler(CommandHandler("ashish", ashish_cmd))
