@@ -1,60 +1,141 @@
-# NEET WALA AI Study Bot — Final
+# NEET WALA BOT — Final AI + Poll Edition
+
+## Features
+
+- AI-powered `/ask`, `/quiz`, `/chapter`, `/poll`, PDF analysis and normal chat
+- Interactive inline-button quiz
+- Native Telegram quiz polls
+- Polls have **NO TIMER**: `/poll` does not set `open_period` or `close_date`
+- Poll answers are recorded into SQLite
+- Automatic +4 for correct and -1 for wrong
+- Top 10 leaderboard
+- Profile and resume
+- PDF → AI summary + 10 MCQs
+- Gemini model discovery/fallback
+- Railway ready
+- No `bot/` package required: all application code is in root `main.py`
+
+## Railway Variables
+
+Set:
+- TELEGRAM_BOT_TOKEN
+- GEMINI_API_KEY
+
+Optional:
+- GEMINI_API_KEY_2
+- GEMINI_MODEL=gemini-3.6-flash
 
 ## Commands
+
+`/start`
+`/help`
+`/ask आपका सवाल`
+`/quiz कोशिका 10`
+`/chapter मानव प्रजनन 10`
+`/poll कोशिका`
+`/leaderboard`
+`/profile`
+`/resume`
+`/pdf`
+`/neet720`
+
+## Important
+
+Never commit real API keys to GitHub.
+For a durable SQLite database on Railway, attach a persistent volume.
+
+
+## Unique AR commands
+
+इस version में सभी commands के अंत में `ar` है ताकि दूसरे Telegram bot के same commands से conflict न हो:
+
 - `/startar`
 - `/helpar`
-- `/quizar <topic> <N>` — inline MCQ quiz
-- `/chapterar <topic> <N>`
-- `/pollar <topic> <N>` — separate native Telegram Quiz Polls, no timer
-- `/pdfar [N]` — upload a Biology PDF after the command; default 90, maximum 90
-- `/askar <question>`
+- `/quizar कोशिका 10`
+- `/chapterar मानव प्रजनन 10`
+- `/pollar कोशिका`
+- `/askar आपका सवाल`
 - `/leaderboardar`
 - `/profilear`
 - `/resumear`
+- `/pdfar`
 - `/neet720ar`
-- `/ASHISH <question>` — group AI trigger only
 
-## PDF → Poll
+`/pollar` native Telegram quiz poll बनाता है और उसमें कोई timer/close date नहीं लगाई जाती।
+
+
+## PDF → 90 NEET Biology Polls
+
+`/pdfar` भेजने के बाद इसी chat/group में Biology PDF upload करें.
+
+Bot:
+1. PDF का selectable text पढ़ता है.
+2. उसी material के concepts से अधिकतम **90** original NEET Biology MCQs बनाता है.
+3. लगभग 50% conceptual, 25% Assertion-Reason/कथन-कारण और 25% statement-based रखता है.
+4. हर question को native Telegram **Quiz Poll** में इसी group/chat में भेजता है.
+5. Poll में `open_period` और `close_date` नहीं हैं, इसलिए **कोई timer नहीं**.
+6. Correct answer और explanation bot database में रखता है.
+
+> Scanned/image-only PDF के लिए OCR अलग से चाहिए.
+> PDF upload के लिए 15 MB application limit रखी गई है.
+
+\n## Fixed in this build
+
+- Ignores old `gemini-1.5-flash` / other deprecated model IDs; default is `gemini-3.1-flash-lite`.
+- Normal messages in groups are ignored; no automatic AI replies.
+- Interactive `/quizar` now continues to Q2, Q3, etc.
+- `/pollar` and PDF-generated polls remain without a timer.
+
+\n## Group AI trigger
+
+Group में bot सामान्य messages का जवाब **नहीं** देगा.
+AI जवाब के लिए केवल:
+`/ASHISH आपका सवाल`
+
+उदाहरण:
+`/ASHISH माइटोकॉन्ड्रिया को powerhouse क्यों कहते हैं?`
+
+`/pollar` group में native Telegram Quiz Poll भेजता है. Poll के लिए bot के पास group में message भेजने की permission होनी चाहिए; permission error आए तो bot को admin बनाकर **Send Messages / Send Polls** अनुमति दें.
+
+
+## Multi-Poll behavior
+
 Use:
-`/pdfar 50`
-then upload the PDF in the same chat/group.
 
-The bot reads the PDF's selectable text and generates **new NEET Biology questions
-from the concepts in the source**, not merely copies the original questions.
-It supports conceptual, statement-based, and Assertion-Reason questions.
+`/pollar कोशिका 5`
 
-- `/pdfar` = 90 questions by default
-- `/pdfar 50` = 50 questions
-- `/pdfar 30` = 30 questions
-- Maximum = 90
-- Every question is a separate native Telegram Quiz Poll.
-- Polls have **no `open_period` and no `close_date`**, so there is no timer.
-- Duplicate questions are removed and the generator requests extra batches until
-  the requested number of unique valid questions is reached.
-- If the source is too small/limited and the requested count cannot be produced,
-  the bot reports that clearly instead of falsely claiming the count was reached.
-- Scanned/image-only PDFs need OCR and are not supported by the current text extractor.
-- PDF upload limit: 15 MB.
+This creates **5 separate native Telegram Quiz Polls** in the current chat.
+They have **no timer** (`open_period` and `close_date` are not set), so members can answer whenever they want.
 
-## Group AI
-Normal group messages are ignored. The bot answers group AI questions only when
-the message starts with `/ASHISH`, e.g.:
-`/ASHISH mitochondria का कार्य क्या है?`
+- Group members can answer the polls.
+- The bot does **not** post the explanation after every answer in the group.
+- The answer + explanation is sent by **private DM to the member who answered**, when Telegram permits the bot to message that user.
+- The user must have opened/started the bot in private chat at least once for the DM to work.
+- Maximum `/pollar` batch size is 20.
 
-## Poll explanations
-The explanation is not posted into the group. When a user answers a quiz poll,
-the bot attempts to send the result and explanation by private DM. The user must
-have opened/started the bot in private chat for Telegram to allow that DM.
 
-## Railway Variables
-Set:
-- `TELEGRAM_BOT_TOKEN`
-- `GEMINI_API_KEY`
+## Duplicate-question fix
 
-Optional:
-- `GEMINI_API_KEY_2`
-- `GEMINI_MODEL=gemini-3.1-flash-lite`
-- `DB_PATH=data/neet_ai.db`
+The PDF and `/pollar` question generator no longer fails just because the AI
+returned duplicate questions. It automatically requests extra questions and
+removes duplicates until the requested number of unique valid questions is
+reached (within a safe retry limit).
 
-The code dynamically checks available Gemini models and ignores deprecated
-1.x/2.0/2.5 model IDs if they are left in old configuration.
+
+## PDF with only 22 original questions
+
+A PDF does **not** need to contain 90 original questions. If it contains 22
+questions, the bot uses the concepts/facts/content in the PDF to create new,
+original NEET-level questions. It does not simply copy the 22 questions.
+
+The bot tries multiple batches and removes duplicates. If it still cannot
+produce 90 valid unique questions from the available material, it posts the
+valid questions it did produce instead of failing with a duplicate error.
+
+
+## PDF poll sender fix
+
+Fixed `name 'post_pdf_polls' is not defined`.
+PDF questions can now be sent as native Telegram Quiz Polls after generation.
+
+The PDF polls have no `open_period` or `close_date`, so there is no timer.
