@@ -112,3 +112,11 @@ They have **no timer** (`open_period` and `close_date` are not set), so members 
 - The answer + explanation is sent by **private DM to the member who answered**, when Telegram permits the bot to message that user.
 - The user must have opened/started the bot in private chat at least once for the DM to work.
 - Maximum `/pollar` batch size is 20.
+
+
+## Duplicate-question fix
+
+The PDF and `/pollar` question generator no longer fails just because the AI
+returned duplicate questions. It automatically requests extra questions and
+removes duplicates until the requested number of unique valid questions is
+reached (within a safe retry limit).

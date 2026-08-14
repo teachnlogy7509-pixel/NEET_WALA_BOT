@@ -610,44 +610,74 @@ def make_multi_poll_prompt(topic, count):
 """
 
 async def generate_poll_questions(topic, count):
-    raw = await asyncio.to_thread(
-        ask_ai, make_multi_poll_prompt(topic, count), SYSTEM, True
-    )
-    data = parse_json(raw)
-    if not isinstance(data, list):
-        raise ValueError("AI ने question list नहीं दी.")
-
+    """
+    Generate at least `count` UNIQUE questions.
+    If AI returns duplicates, request extra batches instead of failing.
+    """
     clean = []
     seen = set()
-    for q in data:
-        if not isinstance(q, dict):
+    attempts = 0
+    max_attempts = 12
+
+    while len(clean) < count and attempts < max_attempts:
+        remaining = count - len(clean)
+
+        # Ask for extra questions so duplicates do not make the final batch short.
+        batch_count = min(max(remaining + 4, 8), 15)
+
+        raw = await asyncio.to_thread(
+            ask_ai, make_multi_poll_prompt(topic, batch_count), SYSTEM, True
+        )
+        data = parse_json(raw)
+
+        if not isinstance(data, list):
+            attempts += 1
             continue
-        options = q.get("options")
-        try:
-            idx = int(q.get("correct_index", -1))
-        except Exception:
-            idx = -1
-        question = str(q.get("question", "")).strip()
-        if (
-            question
-            and isinstance(options, list)
-            and len(options) == 4
-            and idx in (0, 1, 2, 3)
-        ):
-            key = question.lower()
-            if key not in seen:
-                seen.add(key)
-                clean.append({
-                    "question": question[:300],
-                    "options": [str(x)[:100] for x in options],
-                    "correct_index": idx,
-                    "explanation": str(q.get("explanation", ""))[:900],
-                })
+
+        for q in data:
+            if not isinstance(q, dict):
+                continue
+
+            options = q.get("options")
+            try:
+                idx = int(q.get("correct_index", -1))
+            except Exception:
+                idx = -1
+
+            question = str(q.get("question", "")).strip()
+
+            if (
+                question
+                and isinstance(options, list)
+                and len(options) == 4
+                and idx in (0, 1, 2, 3)
+            ):
+                # Normalize whitespace/case only for duplicate detection.
+                key = " ".join(question.lower().split())
+
+                if key not in seen:
+                    seen.add(key)
+                    clean.append({
+                        "question": question[:300],
+                        "options": [str(x)[:100] for x in options],
+                        "correct_index": idx,
+                        "explanation": str(
+                            q.get("explanation", "")
+                        )[:900],
+                    })
+
+                    if len(clean) >= count:
+                        break
+
+        attempts += 1
 
     if len(clean) < count:
         raise ValueError(
-            f"AI ने केवल {len(clean)}/{count} valid questions दिए."
+            f"90 questions पूरे नहीं बन पाए। "
+            f"Unique valid questions: {len(clean)}/{count}. "
+            f"कृपया PDF/विषय के लिए फिर से कोशिश करें."
         )
+
     return clean[:count]
 
 async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
