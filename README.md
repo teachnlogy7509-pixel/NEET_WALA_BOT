@@ -139,3 +139,11 @@ Fixed `name 'post_pdf_polls' is not defined`.
 PDF questions can now be sent as native Telegram Quiz Polls after generation.
 
 The PDF polls have no `open_period` or `close_date`, so there is no timer.
+
+
+## PDF default
+- `/pdfar` = 50 questions by default.
+- `/pdfar 30` = 30 questions.
+- `/pdfar 50` = 50 questions.
+- `/pdfar 90` = 90 questions.
+No other bot features were intentionally changed in this build.
