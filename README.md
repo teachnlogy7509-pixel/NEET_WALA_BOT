@@ -96,3 +96,19 @@ AI जवाब के लिए केवल:
 `/ASHISH माइटोकॉन्ड्रिया को powerhouse क्यों कहते हैं?`
 
 `/pollar` group में native Telegram Quiz Poll भेजता है. Poll के लिए bot के पास group में message भेजने की permission होनी चाहिए; permission error आए तो bot को admin बनाकर **Send Messages / Send Polls** अनुमति दें.
+
+
+## Multi-Poll behavior
+
+Use:
+
+`/pollar कोशिका 5`
+
+This creates **5 separate native Telegram Quiz Polls** in the current chat.
+They have **no timer** (`open_period` and `close_date` are not set), so members can answer whenever they want.
+
+- Group members can answer the polls.
+- The bot does **not** post the explanation after every answer in the group.
+- The answer + explanation is sent by **private DM to the member who answered**, when Telegram permits the bot to message that user.
+- The user must have opened/started the bot in private chat at least once for the DM to work.
+- Maximum `/pollar` batch size is 20.

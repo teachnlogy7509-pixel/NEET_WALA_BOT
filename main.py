@@ -579,39 +579,158 @@ async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📚 Last topic: {r['last_topic'] or '-'}"
     )
 
+
+def make_multi_poll_prompt(topic, count):
+    return f"""
+तुम NEET Biology question setter हो।
+
+विषय: {topic}
+ठीक {count} अलग-अलग NEET-level Biology Quiz MCQ बनाओ।
+
+सिर्फ JSON array दो:
+[
+  {{
+    "question": "प्रश्न",
+    "options": ["A", "B", "C", "D"],
+    "correct_index": 0,
+    "explanation": "छोटी NCERT आधारित व्याख्या"
+  }}
+]
+
+नियम:
+- ठीक {count} प्रश्न
+- हर प्रश्न में ठीक 4 options
+- केवल एक सही उत्तर
+- NEET level
+- NCERT-केंद्रित
+- सभी प्रश्न एक-दूसरे से अलग
+- कथन/Assertion-Reason/Conceptual/Application प्रश्नों का अच्छा mix
+- हिंदी में
+- प्रश्न बहुत लंबे न हों
+"""
+
+async def generate_poll_questions(topic, count):
+    raw = await asyncio.to_thread(
+        ask_ai, make_multi_poll_prompt(topic, count), SYSTEM, True
+    )
+    data = parse_json(raw)
+    if not isinstance(data, list):
+        raise ValueError("AI ने question list नहीं दी.")
+
+    clean = []
+    seen = set()
+    for q in data:
+        if not isinstance(q, dict):
+            continue
+        options = q.get("options")
+        try:
+            idx = int(q.get("correct_index", -1))
+        except Exception:
+            idx = -1
+        question = str(q.get("question", "")).strip()
+        if (
+            question
+            and isinstance(options, list)
+            and len(options) == 4
+            and idx in (0, 1, 2, 3)
+        ):
+            key = question.lower()
+            if key not in seen:
+                seen.add(key)
+                clean.append({
+                    "question": question[:300],
+                    "options": [str(x)[:100] for x in options],
+                    "correct_index": idx,
+                    "explanation": str(q.get("explanation", ""))[:900],
+                })
+
+    if len(clean) < count:
+        raise ValueError(
+            f"AI ने केवल {len(clean)}/{count} valid questions दिए."
+        )
+    return clean[:count]
+
 async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Native Telegram quiz poll. No open_period/close_date = no timing."""
+    """
+    /pollar विषय 5  -> 5 separate native Telegram Quiz Polls.
+    Polls have NO open_period and NO close_date, so they have no timer.
+    Anyone in the group can answer.
+    """
     ensure_user(update.effective_user)
-    topic = " ".join(context.args).strip() if context.args else "NEET Biology"
-    await update.message.reply_text(f"🤖 {topic} का AI poll question बना रहा हूँ...")
+
+    args = list(context.args)
+    count = 1
+
+    # Last argument can be the requested number of polls.
+    if args:
+        try:
+            possible_count = int(args[-1])
+            if 1 <= possible_count <= 20:
+                count = possible_count
+                args = args[:-1]
+        except ValueError:
+            pass
+
+    topic = " ".join(args).strip() if args else "NEET Biology"
+
+    if update.effective_chat.type == "private" and count > 5:
+        # Keep private chat from being flooded accidentally.
+        count = 5
+
+    status = await update.effective_message.reply_text(
+        f"🤖 {topic} पर {count} NEET Quiz Poll "
+        f"{'बना रहा हूँ' if count == 1 else 'बना रहा हूँ'}...\n"
+        f"⏱️ कोई timer नहीं होगा।"
+    )
+
     try:
-        q = await generate_question(topic)
-        msg = await context.bot.send_poll(
-            chat_id=update.effective_chat.id,
-            question=q["question"],
-            options=q["options"],
-            type="quiz",
-            correct_option_id=q["correct_index"],
-            is_anonymous=False,
-            # Deliberately no open_period and no close_date:
-            # the poll has no timer and remains open.
+        questions = await generate_poll_questions(topic, count)
+
+        for n, q in enumerate(questions, 1):
+            msg = await context.bot.send_poll(
+                chat_id=update.effective_chat.id,
+                question=f"Q{n}/{count}  {q['question']}",
+                options=q["options"],
+                type="quiz",
+                correct_option_id=q["correct_index"],
+                is_anonymous=False,
+                # IMPORTANT:
+                # No open_period and no close_date.
+                # The poll remains open and anyone can answer.
+            )
+
+            save_poll(
+                msg.poll.id,
+                update.effective_chat.id,
+                topic,
+                q["question"],
+                q["correct_index"],
+                q.get("explanation", ""),
+            )
+
+            # Avoid sending all polls in the exact same millisecond.
+            if n < len(questions):
+                await asyncio.sleep(0.8)
+
+        await status.edit_text(
+            f"✅ {count} Quiz Poll {'बन गया' if count == 1 else 'बन गए'}!\n"
+            f"📚 विषय: {topic}\n"
+            f"👥 Group में कोई भी member answer कर सकता है।\n"
+            f"⏱️ कोई timer नहीं है।\n"
+            f"💬 Explanation group में नहीं आएगा; "
+            f"जिसने answer किया उसे DM में भेजने की कोशिश होगी।"
         )
-        save_poll(
-            msg.poll.id,
-            update.effective_chat.id,
-            topic,
-            q["question"],
-            q["correct_index"],
-            q.get("explanation", ""),
-        )
+
     except Exception as e:
+        log.exception("Multi-poll generation failed")
         err = str(e)
         if "not enough rights" in err.lower() or "CHAT_ADMIN_REQUIRED" in err:
             err += (
-                "\n\n⚠️ Group में bot को message भेजने और polls भेजने की permission "
-                "दें (जरूरत हो तो bot को Admin बनाएं)."
+                "\n\n⚠️ Bot को group में Polls भेजने की permission दें "
+                "(जरूरत हो तो Admin बनाएं)."
             )
-        await update.message.reply_text(f"❌ Poll error:\n{err[:1400]}")
+        await status.edit_text(f"❌ Poll error:\n{err[:1400]}")
+
 
 async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = update.poll_answer
@@ -624,6 +743,7 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chosen = ans.option_ids[0]
     correct = int(info["correct_index"])
     ok = chosen == correct
+
     mark_answered(ans.poll_id, ans.user.id)
     ensure_user(ans.user)
 
@@ -634,21 +754,32 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         0 if ok else 1,
     )
 
-    user_name = ans.user.full_name or ans.user.username or str(ans.user.id)
-    result = (
-        f"🎉 {user_name} ने सही उत्तर दिया!"
-        if ok else
-        f"❌ {user_name} का उत्तर गलत था।"
+    # Do NOT post the explanation into the group.
+    # Send the result + explanation privately to the person who answered.
+    result = "✅ सही उत्तर!" if ok else "❌ गलत उत्तर!"
+    explanation = info["explanation"] or "इस प्रश्न की explanation उपलब्ध नहीं है."
+
+    dm_text = (
+        f"{result}\n\n"
+        f"📚 {info['topic']}\n"
+        f"📝 {info['question']}\n\n"
+        f"💡 Explanation:\n{explanation}\n\n"
+        f"📊 आपका score update हो गया है।"
     )
-    explanation = info["explanation"] or ""
+
     try:
         await context.bot.send_message(
-            chat_id=info["chat_id"],
-            text=f"{result}\n💡 {explanation}",
+            chat_id=ans.user.id,
+            text=dm_text[:3900],
         )
     except Exception as e:
-        log.warning("Could not send poll result message: %s", e)
-
+        # Telegram does not allow a bot to start a private chat with a user
+        # who has never opened/started the bot.
+        log.info(
+            "Could not DM poll explanation to user %s: %s",
+            ans.user.id,
+            e,
+        )
 
 async def pdf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
