@@ -258,6 +258,36 @@ def parse_json(text):
         text = text.replace("```json", "", 1).replace("```", "", 1).strip()
     return json.loads(text)
 
+def make_pdf_question_prompt(book_text, count):
+    """Build a prompt for generating fresh NEET Biology questions from PDF text."""
+    return f"""
+नीचे दी गई PDF सामग्री के आधार पर ठीक {count} नए, मूल NEET Biology MCQ बनाओ।
+
+PDF सामग्री:
+{book_text}
+
+महत्वपूर्ण नियम:
+- प्रश्न PDF के concepts/facts/relationships पर आधारित हों।
+- PDF में जितने मूल प्रश्न हैं, उनकी संख्या output को सीमित नहीं करती।
+- प्रश्नों को शब्दशः copy मत करो; नए तरीके से पूछो।
+- एक ही तथ्य को मामूली शब्द बदलकर दोबारा मत पूछो।
+- NEET level के conceptual, statement-based, application और Assertion-Reason प्रश्नों का अच्छा mix रखो।
+- NCERT-केंद्रित रहो।
+- हिंदी में बनाओ।
+- हर प्रश्न में ठीक 4 options और केवल 1 सही उत्तर हो।
+- correct_index केवल 0,1,2,3 हो।
+
+सिर्फ JSON array दो:
+[
+  {{
+    "question": "प्रश्न",
+    "options": ["A", "B", "C", "D"],
+    "correct_index": 0,
+    "explanation": "छोटी और स्पष्ट व्याख्या"
+  }}
+]
+"""
+
 def make_question_prompt(topic):
     return f"""
 विषय: {topic}
