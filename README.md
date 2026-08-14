@@ -78,3 +78,21 @@ Bot:
 
 > Scanned/image-only PDF के लिए OCR अलग से चाहिए.
 > PDF upload के लिए 15 MB application limit रखी गई है.
+
+\n## Fixed in this build
+
+- Ignores old `gemini-1.5-flash` / other deprecated model IDs; default is `gemini-3.1-flash-lite`.
+- Normal messages in groups are ignored; no automatic AI replies.
+- Interactive `/quizar` now continues to Q2, Q3, etc.
+- `/pollar` and PDF-generated polls remain without a timer.
+
+\n## Group AI trigger
+
+Group में bot सामान्य messages का जवाब **नहीं** देगा.
+AI जवाब के लिए केवल:
+`/ASHISH आपका सवाल`
+
+उदाहरण:
+`/ASHISH माइटोकॉन्ड्रिया को powerhouse क्यों कहते हैं?`
+
+`/pollar` group में native Telegram Quiz Poll भेजता है. Poll के लिए bot के पास group में message भेजने की permission होनी चाहिए; permission error आए तो bot को admin बनाकर **Send Messages / Send Polls** अनुमति दें.

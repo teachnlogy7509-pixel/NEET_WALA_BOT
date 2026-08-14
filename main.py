@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import logging
+import re
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -25,7 +26,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip()
 DB_PATH = os.getenv("DB_PATH", "data/neet_ai.db")
 
 logging.basicConfig(
@@ -190,11 +191,10 @@ def model_candidates(client):
     # The default is a currently documented Gemini model. We also discover
     # models exposed by the API so an unavailable model does not hard-fail.
     preferred = [
-        GEMINI_MODEL,
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
         "gemini-3.1-flash-lite",
-        "gemini-3-flash-preview",
+        "gemini-3.1-flash",
+        "gemini-3.5-flash",
+        GEMINI_MODEL,
     ]
     found = []
     try:
@@ -206,6 +206,14 @@ def model_candidates(client):
                 found.append(name)
     except Exception as e:
         log.warning("Gemini model listing failed: %s", e)
+
+    deprecated_prefixes = (
+        "gemini-1.5-", "gemini-1.0-", "gemini-2.0-", "gemini-2.5-"
+    )
+    preferred = [
+        m for m in preferred
+        if m and not m.lower().startswith(deprecated_prefixes)
+    ]
 
     result = []
     for m in preferred:
@@ -427,7 +435,7 @@ async def quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             batch = min(5, count - start_i)
             questions.extend(await generate_questions(topic, batch))
         save_quiz(update.effective_user.id, topic, questions)
-        await send_next_inline_question(update, context)
+        await send_next_inline_question(update, context, update.effective_user.id)
     except Exception as e:
         await update.message.reply_text(
             f"❌ Quiz generation error:\n{str(e)[:1000]}"
@@ -442,14 +450,20 @@ async def chapter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await quiz_cmd(update, context)
 
-async def send_next_inline_question(update, context):
-    row = get_quiz(update.effective_user.id)
+async def send_next_inline_question(target, context, user_id=None):
+    """Send the next interactive question for an Update or CallbackQuery."""
+    if user_id is None:
+        user_id = getattr(getattr(target, "effective_user", None), "id", None)
+        if user_id is None:
+            user_id = getattr(getattr(target, "from_user", None), "id", None)
+
+    row = get_quiz(user_id)
     if not row:
         return
+
     questions = json.loads(row["questions_json"])
     i = row["current_index"]
     if i >= len(questions):
-        await finish_inline_quiz(update, context, row["topic"], row["score"], len(questions))
         return
 
     q = questions[i]
@@ -464,9 +478,15 @@ async def send_next_inline_question(update, context):
         f"📝 प्रश्न {i+1}/{len(questions)}\n"
         f"📚 {row['topic']}\n\n{q['question']}"
     )
-    await update.effective_message.reply_text(
-        text, reply_markup=InlineKeyboardMarkup(buttons)
-    )
+
+    if getattr(target, "message", None):
+        await target.message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    else:
+        await target.effective_message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup(buttons)
+        )
 
 async def inline_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -514,7 +534,7 @@ async def inline_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             clear_quiz(query.from_user.id)
         else:
-            await send_next_inline_question(query, context)
+            await send_next_inline_question(query, context, query.from_user.id)
 
 async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
@@ -528,7 +548,7 @@ async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"▶️ Resume: {row['topic']}\n"
         f"Question: {row['current_index']+1}/{len(json.loads(row['questions_json']))}"
     )
-    await send_next_inline_question(update, context)
+    await send_next_inline_question(update, context, update.effective_user.id)
 
 async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
@@ -585,9 +605,13 @@ async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             q.get("explanation", ""),
         )
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ Poll error:\n{str(e)[:1000]}"
-        )
+        err = str(e)
+        if "not enough rights" in err.lower() or "CHAT_ADMIN_REQUIRED" in err:
+            err += (
+                "\n\n⚠️ Group में bot को message भेजने और polls भेजने की permission "
+                "दें (जरूरत हो तो bot को Admin बनाएं)."
+            )
+        await update.message.reply_text(f"❌ Poll error:\n{err[:1400]}")
 
 async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = update.poll_answer
@@ -854,7 +878,47 @@ async def neet720_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "शुरू करने के लिए /quizar Biology 50, /quizar Physics 50 या /quizar Chemistry 50 इस्तेमाल करें."
     )
 
+
+async def ashish_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Group AI trigger:
+    The bot answers AI questions ONLY when /ASHISH is written.
+    Ordinary group messages are ignored.
+    """
+    ensure_user(update.effective_user)
+
+    raw = update.effective_message.text or ""
+    # Remove /ASHISH and optional @botusername.
+    question = re.sub(
+        r"^\s*/ashish(?:@\w+)?\s*",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    if not question:
+        await update.effective_message.reply_text(
+            "🤖 हाँ, मैं यहाँ हूँ।\n"
+            "ऐसे लिखें:\n"
+            "/ASHISH कोशिका का powerhouse क्या है?"
+        )
+        return
+
+    await update.effective_message.reply_text("🤖 AI सोच रहा है...")
+    try:
+        answer = await asyncio.to_thread(ask_ai, question, SYSTEM, False)
+        await send_parts(update.effective_message, answer)
+    except Exception as e:
+        log.exception("ASHISH command failed")
+        await update.effective_message.reply_text(
+            f"❌ AI error:\n{str(e)[:900]}"
+        )
+
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # GROUP: ignore ordinary messages. AI replies only through /ASHISH.
+    if update.effective_chat.type != "private":
+        return
+
     text = (update.message.text or "").strip()
     if not text:
         return
@@ -892,6 +956,13 @@ def build_app():
     app.add_handler(CallbackQueryHandler(inline_answer, pattern=r"^ans:"))
     app.add_handler(PollAnswerHandler(poll_answer))
     app.add_handler(MessageHandler(filters.Document.PDF, pdf_handler))
+    # Telegram command handlers normally use lowercase command names.
+    # This Regex handler also accepts the exact /ASHISH trigger in groups.
+    app.add_handler(MessageHandler(
+        filters.Regex(r"^/ASHISH(?:@\\w+)?(?:\\s+.*)?$"),
+        ashish_cmd
+    ))
+    app.add_handler(CommandHandler("ashish", ashish_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 
     app.add_error_handler(error_handler)
