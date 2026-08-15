@@ -187,3 +187,16 @@ AI-generated question cannot crash the PDF poll batch.
 - Question generation no longer requests or sends explanations.
 - Poll answers send only correct/incorrect + score update, not explanations.
 - This reduces generated output and helps prevent the bot from stalling during question generation/answering.
+
+
+## Gemini automatic fallback
+
+Default model: `gemini-3.7-flash`.
+
+If Gemini returns a temporary `503 UNAVAILABLE`, the bot automatically tries
+the fallback models in order:
+1. Gemini 3.7 Flash
+2. Gemini 3.6 Flash
+3. Gemini 3.5 Flash
+
+The existing two-API-key setup is preserved.
