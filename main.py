@@ -28,7 +28,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash").strip()
 DB_PATH = os.getenv("DB_PATH", "data/neet_ai.db")
 
 logging.basicConfig(
@@ -205,7 +205,7 @@ def get_client(key):
 def model_candidates(client):
     # Use ONLY the configured stable model. Do not silently fall back to a
     # different model (which can unexpectedly hit a different quota).
-    return [GEMINI_MODEL or "gemini-3.6-flash"]
+    return [GEMINI_MODEL or "gemini-3.7-flash"]
 
 def ask_ai(prompt, system=None, json_mode=False):
     keys = [k for k in (GEMINI_API_KEY, GEMINI_API_KEY_2) if k]
@@ -276,14 +276,14 @@ PDF सामग्री:
 - हिंदी में बनाओ।
 - हर प्रश्न में ठीक 4 options और केवल 1 सही उत्तर हो।
 - correct_index केवल 0,1,2,3 हो।
+- explanation मत बनाओ; केवल question, options और correct_index दो।
 
 सिर्फ JSON array दो:
 [
   {{
     "question": "प्रश्न",
     "options": ["A", "B", "C", "D"],
-    "correct_index": 0,
-    "explanation": "छोटी और स्पष्ट व्याख्या"
+    "correct_index": 0
   }}
 ]
 """
@@ -300,7 +300,6 @@ NCERT-केंद्रित रहो।
   "question": "प्रश्न",
   "options": ["A विकल्प", "B विकल्प", "C विकल्प", "D विकल्प"],
   "correct_index": 0,
-  "explanation": "छोटी और स्पष्ट व्याख्या"
 }}
 
 नियम:
@@ -309,6 +308,7 @@ NCERT-केंद्रित रहो।
 - हिंदी में
 - एक ही सही उत्तर हो
 - duplicate या अस्पष्ट प्रश्न नहीं
+- explanation मत बनाओ; केवल question, options और correct_index दो
 """
 
 def make_quiz_prompt(topic, count):
@@ -321,8 +321,7 @@ def make_quiz_prompt(topic, count):
   {{
     "question": "प्रश्न",
     "options": ["A", "B", "C", "D"],
-    "correct_index": 0,
-    "explanation": "व्याख्या"
+    "correct_index": 0
   }}
 ]
 
@@ -334,6 +333,7 @@ def make_quiz_prompt(topic, count):
 - हिंदी
 - कोई duplicate नहीं
 - कम से कम 2 questions concept/application आधारित
+- explanation मत बनाओ; केवल question, options और correct_index दो
 """
 
 async def send_parts(message, text):
@@ -395,7 +395,7 @@ async def generate_questions(topic, count):
                             "question": question[:300],
                             "options": [str(x)[:100] for x in opts],
                             "correct_index": idx,
-                            "explanation": str(q.get("explanation", ""))[:900],
+                            "explanation": "",
                         })
                         if len(clean) >= count:
                             break
@@ -459,7 +459,7 @@ async def run_scheduled_poll(bot,row):
             msg=await bot.send_poll(chat_id=chat_id,question=f"Q{n}/{len(questions)}  {q['question']}",
                                     options=q["options"],type="quiz",
                                     correct_option_id=q["correct_index"],is_anonymous=False)
-            save_poll(msg.poll.id,chat_id,topic,q["question"],q["correct_index"],q.get("explanation",""))
+            save_poll(msg.poll.id,chat_id,topic,q["question"],q["correct_index"],"")
             if n<len(questions): await asyncio.sleep(.8)
         await status.edit_text(f"✅ {len(questions)} scheduled polls भेज दिए!\n📚 {topic}\n⏱️ कोई timer नहीं है।")
     except Exception as e:
@@ -533,7 +533,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/quizar कोशिका 10 — Interactive MCQ test\n"
         "/pollar कोशिका — Native Telegram quiz poll, बिना timing\n"
         "/chapterar मानव_प्रजनन 10 — Chapter test\n"
-        "/askar आपका सवाल — AI explanation\n"
+        "/askar आपका सवाल — AI जवाब\n"
         "/leaderboardar — Top 10\n"
         "/profilear — आपकी progress\n"
         "/resumear — अधूरा quiz जारी करें\n"
@@ -627,7 +627,7 @@ async def _quiz_timeout(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(
         chat_id=data["chat_id"],
         text=f"⏰ समय समाप्त!\nसही उत्तर: {chr(65+q['correct_index'])}) "
-             f"{q['options'][q['correct_index']]}\n\n💡 {q.get('explanation','')}"
+             f"{q['options'][q['correct_index']]}"
     )
 
     new_row = get_quiz(user_id)
@@ -707,7 +707,6 @@ async def _quiz_timeout_after_30(context, user_id, expected_index, chat_id):
             text=f"⏰ 30 सेकंड पूरे!\n"
                  f"सही उत्तर: {chr(65+q['correct_index'])}) "
                  f"{q['options'][q['correct_index']]}\n\n"
-                 f"💡 {q.get('explanation','')}"
         )
         new_row = get_quiz(user_id)
         if new_row and new_row["current_index"] < len(questions):
@@ -751,13 +750,11 @@ async def inline_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     score = row["score"] + (4 if ok else -1)
 
     result = "✅ सही उत्तर!" if ok else f"❌ गलत! सही उत्तर: {chr(65+correct)}) {q['options'][correct]}"
-    explanation = q.get("explanation", "")
-
     update_quiz(query.from_user.id, i + 1, score)
     add_result(query.from_user.id, row["topic"], 1 if ok else 0, 0 if ok else 1)
 
     await query.edit_message_text(
-        f"{result}\n\n💡 {explanation}\n\n📊 Current score: {score}"
+        f"{result}\n\n📊 Current score: {score}"
     )
 
     new_row = get_quiz(query.from_user.id)
@@ -829,8 +826,7 @@ def make_multi_poll_prompt(topic, count):
   {{
     "question": "प्रश्न",
     "options": ["A", "B", "C", "D"],
-    "correct_index": 0,
-    "explanation": "छोटी NCERT आधारित व्याख्या"
+    "correct_index": 0
   }}
 ]
 
@@ -846,6 +842,7 @@ def make_multi_poll_prompt(topic, count):
 - कथन/Assertion-Reason/Conceptual/Application प्रश्नों का अच्छा mix
 - हिंदी में
 - प्रश्न बहुत लंबे न हों
+- explanation मत बनाओ; केवल question, options और correct_index दो
 """
 
 async def generate_poll_questions(topic, count, source_text=""):
@@ -898,7 +895,7 @@ async def generate_poll_questions(topic, count, source_text=""):
                             "question": question[:300],
                             "options": [str(x)[:100] for x in opts],
                             "correct_index": idx,
-                            "explanation": str(q.get("explanation", ""))[:900],
+                            "explanation": "",
                         })
                         if len(clean) >= count:
                             break
@@ -941,7 +938,7 @@ async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 is_anonymous=False,
             )
             save_poll(msg.poll.id, update.effective_chat.id, topic,
-                      q["question"], q["correct_index"], q.get("explanation",""))
+                      q["question"], q["correct_index"], "")
             if n < len(questions):
                 await asyncio.sleep(0.8)
 
@@ -976,16 +973,11 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         0 if ok else 1,
     )
 
-    # Do NOT post the explanation into the group.
-    # Send the result + explanation privately to the person who answered.
+    # No explanation is generated or sent. Keep poll answering fast.
     result = "✅ सही उत्तर!" if ok else "❌ गलत उत्तर!"
-    explanation = info["explanation"] or "इस प्रश्न की explanation उपलब्ध नहीं है."
-
     dm_text = (
         f"{result}\n\n"
         f"📚 {info['topic']}\n"
-        f"📝 {info['question']}\n\n"
-        f"💡 Explanation:\n{explanation}\n\n"
         f"📊 आपका score update हो गया है।"
     )
 
@@ -998,7 +990,7 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Telegram does not allow a bot to start a private chat with a user
         # who has never opened/started the bot.
         log.info(
-            "Could not DM poll explanation to user %s: %s",
+            "Could not DM poll result to user %s: %s",
             ans.user.id,
             e,
         )
@@ -1064,7 +1056,7 @@ async def generate_pdf_questions(book_text, count=50):
                             "question": question[:300],
                             "options": [str(x)[:100] for x in opts],
                             "correct_index": idx,
-                            "explanation": str(q.get("explanation", ""))[:900],
+                            "explanation": "",
                         })
                         if len(clean) >= count:
                             break
@@ -1079,12 +1071,12 @@ async def post_pdf_polls(chat_id, questions, bot, status_message=None):
     for i,q in enumerate(questions,1):
         msg=await bot.send_poll(
             chat_id=chat_id,
-            question=f"Q{i}/{total}  {q['question']}",
+            question=f"Q{i}/{total}  {q["question"]}"[:300],
             options=q["options"], type="quiz",
             correct_option_id=q["correct_index"], is_anonymous=False
         )
         save_poll(msg.poll.id,chat_id,"PDF • NEET Biology",
-                  q["question"],q["correct_index"],q.get("explanation",""))
+                  q["question"],q["correct_index"],"")
         if i<total: await asyncio.sleep(0.8)
     if status_message:
         await status_message.edit_text(

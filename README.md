@@ -173,3 +173,17 @@ No other bot features were intentionally changed in this build.
 `/shedulear 21:00 कोशिका 5` creates a daily IST schedule for 5 untimed quiz polls.
 `/shedulearlistrar` lists schedules. `/sheduleardel 1` deletes schedule #1.
 Only Telegram group admins can manage schedules. Schedules persist in SQLite across Railway restarts.
+
+
+## PDF poll 300-character fix
+
+Telegram Quiz Poll questions have a maximum length of 300 characters.
+Generated PDF questions are now safely truncated before sending, so a long
+AI-generated question cannot crash the PDF poll batch.
+
+
+## Final AI performance update
+- Default Gemini model: `gemini-3.7-flash`
+- Question generation no longer requests or sends explanations.
+- Poll answers send only correct/incorrect + score update, not explanations.
+- This reduces generated output and helps prevent the bot from stalling during question generation/answering.
